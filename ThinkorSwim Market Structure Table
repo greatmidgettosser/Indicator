@@ -1,0 +1,169 @@
+# ============================================================
+# Market Structure Table — ThinkScript Port
+# Ported from Quantower C# indicator MarketStructureTable.cs
+# ============================================================
+
+# ── Inputs ───────────────────────────────────────────────────
+input LookbackShort  = 25;
+input LookbackMid    = 50;
+input LookbackLong   = 100;
+input ShowPivots     = yes;
+input PivotWindow    = 3;
+
+# ── VWAP (session-reset daily) ───────────────────────────────
+def tp      = (high + low + close) / 3.0;
+def cumTP   = if GetDay() != GetDay()[1] then tp * volume
+              else cumTP[1] + tp * volume;
+def cumVol  = if GetDay() != GetDay()[1] then volume
+              else cumVol[1] + volume;
+def vwap    = if cumVol > 0 then cumTP / cumVol else close;
+def spread  = close - vwap;
+
+# ── Pivot Detection ──────────────────────────────────────────
+# A pivot high is confirmed when the bar PivotWindow bars ago is the
+# highest close in the full (2*PivotWindow+1) window centered on it.
+# We split the window into left wing, center, and right wing and
+# compare explicitly to avoid TOS misresolving chained offsets.
+
+def w = PivotWindow;
+
+# Center bar (the candidate — w bars ago)
+def cVal = close[w];
+
+# Left wing: highest/lowest of bars further back than center (bars w+1 .. 2w)
+# Highest(close, w) offset by [2*w] gives the highest of bars [w+1]..[2w]
+def leftMax = Highest(close, w)[2 * w];
+def leftMin = Lowest(close,  w)[2 * w];
+
+# Right wing: highest/lowest of bars more recent than center (bars 0 .. w-1)
+def rightMax = Highest(close, w);
+def rightMin = Lowest(close,  w);
+
+# Full window highest/lowest to confirm center is global max/min
+def fullMax = Highest(close, 2 * w + 1)[w];
+def fullMin = Lowest(close,  2 * w + 1)[w];
+
+# Pivot high: center >= all left and all right, and equals the full window max
+def isPivHigh = cVal >= leftMax and cVal >= rightMax and cVal == fullMax;
+# Pivot low:  center <= all left and all right, and equals the full window min
+def isPivLow  = cVal <= leftMin and cVal <= rightMin and cVal == fullMin;
+
+def pivHigh = if isPivHigh then cVal else Double.NaN;
+def pivLow  = if isPivLow  then cVal else Double.NaN;
+
+# ── Pivot Triangles on Chart ─────────────────────────────────
+# Plot at the confirmed pivot bar (w bars ago) using high/low of that bar
+AddChartBubble(ShowPivots and !IsNaN(pivHigh), high[w], "▼", Color.RED,   yes);
+AddChartBubble(ShowPivots and !IsNaN(pivLow),  low[w],  "▲", Color.GREEN, no);
+
+# ── Spread Slope (bull = spread rising over lookback) ────────
+def spreadSlope_S = spread - spread[LookbackShort]  >= 0;
+def spreadSlope_M = spread - spread[LookbackMid]    >= 0;
+def spreadSlope_L = spread - spread[LookbackLong]   >= 0;
+
+def spreadDelta_S = Round(spread - spread[LookbackShort],  4);
+def spreadDelta_M = Round(spread - spread[LookbackMid],    4);
+def spreadDelta_L = Round(spread - spread[LookbackLong],   4);
+
+# ── Avg Points Per Bar (mean |close-open| over lookback) ─────
+def sumPPB_S = fold i_s = 1 to LookbackShort + 1 with a_s = 0 do
+                   a_s + AbsValue(close[i_s] - open[i_s]);
+def avgPPB_S = sumPPB_S / LookbackShort;
+
+def sumPPB_M = fold i_m = 1 to LookbackMid + 1 with a_m = 0 do
+                   a_m + AbsValue(close[i_m] - open[i_m]);
+def avgPPB_M = sumPPB_M / LookbackMid;
+
+def sumPPB_L = fold i_l = 1 to LookbackLong + 1 with a_l = 0 do
+                   a_l + AbsValue(close[i_l] - open[i_l]);
+def avgPPB_L = sumPPB_L / LookbackLong;
+
+# ── Pivot Structure: upDisp vs downDisp over lookback ────────
+# Track the most recent prior pivot high and low as running values using
+# recursive defs. Each bar we check if a new pivot fired and update accordingly.
+# Displacement is accumulated each time we get a new pivot of either type.
+# The open/partial swing from the last pivot to current price is also included,
+# matching the C# logic: if last pivot was a low, add max(0, close - lastPivLow)
+#                         if last pivot was a high, add max(0, lastPivHigh - close)
+
+# Last seen pivot high and low (carried forward each bar)
+def lastPivHigh = if !IsNaN(pivHigh) then pivHigh
+                  else if IsNaN(lastPivHigh[1]) then Double.NaN
+                  else lastPivHigh[1];
+
+def lastPivLow  = if !IsNaN(pivLow) then pivLow
+                  else if IsNaN(lastPivLow[1]) then Double.NaN
+                  else lastPivLow[1];
+
+# Track which pivot type fired most recently (1 = high, -1 = low)
+def lastPivType = if !IsNaN(pivHigh) then 1
+                  else if !IsNaN(pivLow) then -1
+                  else lastPivType[1];
+
+# Running upDisp: each time a new pivot high appears, add max(0, pivHigh - lastPivLow)
+def runUpDisp   = if !IsNaN(pivHigh) and !IsNaN(lastPivLow[1])
+                  then runUpDisp[1] + Max(0, pivHigh - lastPivLow[1])
+                  else runUpDisp[1];
+
+# Running downDisp: each time a new pivot low appears, add max(0, lastPivHigh - pivLow)
+def runDownDisp = if !IsNaN(pivLow) and !IsNaN(lastPivHigh[1])
+                  then runDownDisp[1] + Max(0, lastPivHigh[1] - pivLow)
+                  else runDownDisp[1];
+
+# Open swing from last confirmed pivot to current price
+def openUpDisp   = if lastPivType == -1 and !IsNaN(lastPivLow)
+                   then Max(0, close - lastPivLow)
+                   else 0;
+def openDownDisp = if lastPivType == 1 and !IsNaN(lastPivHigh)
+                   then Max(0, lastPivHigh - close)
+                   else 0;
+
+# For each lookback, displacement = (current running + open swing) minus value at lookback bars ago
+def upDisp_S   = (runUpDisp + openUpDisp)   - GetValue(runUpDisp   + openUpDisp,   LookbackShort, 500);
+def downDisp_S = (runDownDisp + openDownDisp) - GetValue(runDownDisp + openDownDisp, LookbackShort, 500);
+def pBull_S    = upDisp_S >= downDisp_S;
+
+def upDisp_M   = (runUpDisp + openUpDisp)   - GetValue(runUpDisp   + openUpDisp,   LookbackMid, 500);
+def downDisp_M = (runDownDisp + openDownDisp) - GetValue(runDownDisp + openDownDisp, LookbackMid, 500);
+def pBull_M    = upDisp_M >= downDisp_M;
+
+def upDisp_L   = (runUpDisp + openUpDisp)   - GetValue(runUpDisp   + openUpDisp,   LookbackLong, 500);
+def downDisp_L = (runDownDisp + openDownDisp) - GetValue(runDownDisp + openDownDisp, LookbackLong, 500);
+def pBull_L    = upDisp_L >= downDisp_L;
+
+# ── Labels ───────────────────────────────────────────────────
+# Short row
+AddLabel(yes,
+    LookbackShort + "b | " +
+    (if spreadSlope_S then "BULL " else "BEAR ") +
+    AsText(spreadDelta_S) + " | " +
+    AsText(Round(avgPPB_S, 2)) + " pb | " +
+    (if pBull_S then "BULL up " else "BEAR up ") +
+    AsText(Round(upDisp_S, 2)) + " down " + AsText(Round(downDisp_S, 2)),
+    if spreadSlope_S and pBull_S then Color.GREEN
+    else if !spreadSlope_S and !pBull_S then Color.RED
+    else Color.YELLOW);
+
+# Mid row
+AddLabel(yes,
+    LookbackMid + "b | " +
+    (if spreadSlope_M then "BULL " else "BEAR ") +
+    AsText(spreadDelta_M) + " | " +
+    AsText(Round(avgPPB_M, 2)) + " pb | " +
+    (if pBull_M then "BULL up " else "BEAR up ") +
+    AsText(Round(upDisp_M, 2)) + " down " + AsText(Round(downDisp_M, 2)),
+    if spreadSlope_M and pBull_M then Color.GREEN
+    else if !spreadSlope_M and !pBull_M then Color.RED
+    else Color.YELLOW);
+
+# Long row
+AddLabel(yes,
+    LookbackLong + "b | " +
+    (if spreadSlope_L then "BULL " else "BEAR ") +
+    AsText(spreadDelta_L) + " | " +
+    AsText(Round(avgPPB_L, 2)) + " pb | " +
+    (if pBull_L then "BULL up " else "BEAR up ") +
+    AsText(Round(upDisp_L, 2)) + " down " + AsText(Round(downDisp_L, 2)),
+    if spreadSlope_L and pBull_L then Color.GREEN
+    else if !spreadSlope_L and !pBull_L then Color.RED
+    else Color.YELLOW);
