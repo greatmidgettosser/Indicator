@@ -1,0 +1,94 @@
+# ============================================================
+# Custom Ichimoku Cloud — 1, 1, 25
+# Senkou Span A and B only(cloud only), no displacement, no other lines
+# ============================================================
+
+input TenkanPeriod = 1;
+input KijunPeriod  = 1;
+input SenkouBPeriod = 25;
+
+# Tenkan-sen: (highest high + lowest low) / 2 over TenkanPeriod
+def tenkan = (Highest(high, TenkanPeriod) + Lowest(low, TenkanPeriod)) / 2;
+
+# Kijun-sen: (highest high + lowest low) / 2 over KijunPeriod
+def kijun  = (Highest(high, KijunPeriod) + Lowest(low, KijunPeriod)) / 2;
+
+# Senkou Span A: (Tenkan + Kijun) / 2, no displacement
+def SpanA = (tenkan + kijun) / 2;
+
+# Senkou Span B: (highest high + lowest low) / 2 over SenkouBPeriod, no displacement
+def SpanB = (Highest(high, SenkouBPeriod) + Lowest(low, SenkouBPeriod)) / 2;
+
+# Cloud shading only
+AddCloud(SpanA, SpanB, Color.GREEN, Color.RED);
+
+
+
+
+
+
+
+
+# ============================================================
+# Waddah Attar Explosion — ThinkScript
+# Histogram only, no signal line
+# ============================================================
+
+declare lower;
+
+input Sensitivity   = 150;
+input FastLength    = 20;
+input SlowLength    = 40;
+input BBLength      = 20;
+input BBMultiplier  = 2.0;
+
+# ── MACD difference (trend direction and momentum) ───────────
+def fastMACD  = MACD(fastLength = FastLength, slowLength = SlowLength, MACDLength = 1).Value;
+def t1        = (fastMACD - fastMACD[1]) * Sensitivity;
+
+# ── Bollinger Band width (explosion threshold) ───────────────
+def basis     = Average(close, BBLength);
+def dev       = BBMultiplier * StandardDeviation(close, BBLength);
+def upperBB   = basis + dev;
+def lowerBB   = basis - dev;
+def bbWidth   = upperBB - lowerBB;
+def e1        = bbWidth[1];
+
+# ── Explosion value ──────────────────────────────────────────
+def explosion = bbWidth - e1;
+
+# ── Histogram bars: color based on trend direction and momentum
+# Bright green  = uptrend, gaining momentum  (t1 > 0 and t1 > t1[1])
+# Dim green     = uptrend, losing momentum   (t1 > 0 and t1 <= t1[1])
+# Bright red    = downtrend, gaining momentum (t1 < 0 and t1 < t1[1])
+# Dim red       = downtrend, losing momentum  (t1 < 0 and t1 >= t1[1])
+
+plot WAE = if t1 >= 0 then t1 else -t1;
+WAE.SetPaintingStrategy(PaintingStrategy.HISTOGRAM);
+WAE.SetLineWeight(3);
+WAE.AssignValueColor(
+    if t1 > 0 and t1 > t1[1]  then Color.GREEN
+    else if t1 > 0             then Color.DARK_GREEN
+    else if t1 < 0 and t1 < t1[1] then Color.RED
+    else                            Color.DARK_RED
+);
+
+# ── BB width line (explosion threshold) ──────────────────────
+plot Threshold = bbWidth;
+Threshold.SetDefaultColor(Color.YELLOW);
+Threshold.SetLineWeight(2);
+Threshold.SetStyle(Curve.FIRM);
+
+# ── Zero line ────────────────────────────────────────────────
+plot ZeroLine = 0;
+ZeroLine.SetDefaultColor(Color.GRAY);
+ZeroLine.SetStyle(Curve.SHORT_DASH);
+
+
+
+
+
+
+
+
+
