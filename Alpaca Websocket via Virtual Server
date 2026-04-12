@@ -1,0 +1,113 @@
+import asyncio
+import pandas as pd
+from alpaca.data.live import StockDataStream
+from datetime import datetime
+import pytz
+import os
+import schedule
+import time
+import threading
+import dropbox
+from dropbox.files import WriteMode
+from dotenv import load_dotenv
+
+load_dotenv('/home/ubuntu/alpaca-stream/.env')
+
+API_KEY               = os.getenv("API_KEY")
+SECRET_KEY            = os.getenv("SECRET_KEY")
+DROPBOX_TOKEN         = os.getenv("DROPBOX_TOKEN")
+DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
+APP_KEY_DBX           = os.getenv("APP_KEY_DBX")
+APP_SECRET_DBX        = os.getenv("APP_SECRET_DBX")
+
+SYMBOLS    = ["SPY", "QQQ", "IWM", "AAPL", "AMZN", "PLTR", "TSLA", "IBIT", "SLV", "NVDA", "MSFT", "META", "MARA", "GOOGL", "GLD", "SMCI"]
+CSV_DIR    = "/home/ubuntu/alpaca-stream/live_data"
+eastern    = pytz.timezone("America/New_York")
+wss_client = None
+
+os.makedirs(CSV_DIR, exist_ok=True)
+
+def upload_to_dropbox(symbol, local_path, dropbox_path):
+    try:
+        dbx = dropbox.Dropbox(
+            oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
+            app_key=APP_KEY_DBX,
+            app_secret=APP_SECRET_DBX
+        )
+        with open(local_path, "rb") as f:
+            dbx.files_upload(f.read(), dropbox_path, mode=WriteMode.overwrite)
+        print(f"Uploaded {os.path.basename(local_path)} to Dropbox")
+    except Exception as e:
+        print(f"Dropbox upload error for {symbol}: {e}")
+
+def resample_to_5min(symbol):
+    local_path = f"{CSV_DIR}/{symbol}_live.csv"
+    out_path   = f"{CSV_DIR}/{symbol}_live_5min.csv"
+    try:
+        df = pd.read_csv(local_path)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+        df['timestamp'] = df['timestamp'].dt.tz_convert(eastern)
+        df = df.set_index('timestamp').sort_index()
+        df_5 = df.resample('5min').agg({
+            'open':   'first',
+            'high':   'max',
+            'low':    'min',
+            'close':  'last',
+            'volume': 'sum',
+            'vwap':   'last'
+        }).dropna(subset=['open'])
+        df_5.to_csv(out_path)
+    except Exception as e:
+        print(f"Resample error for {symbol}: {e}")
+    return out_path
+
+async def bar_handler(bar):
+    local_path = f"{CSV_DIR}/{bar.symbol}_live.csv"
+    ts_eastern = bar.timestamp.astimezone(eastern)
+    row = {
+        "timestamp": ts_eastern,
+        "open":      bar.open,
+        "high":      bar.high,
+        "low":       bar.low,
+        "close":     bar.close,
+        "volume":    bar.volume,
+        "vwap":      getattr(bar, "vwap", None)
+    }
+    df = pd.DataFrame([row])
+    df.to_csv(local_path, mode="a", header=not os.path.exists(local_path), index=False)
+    print(f"Bar saved: {bar.symbol} {ts_eastern}")
+
+    # Upload 1-min file
+    upload_to_dropbox(bar.symbol, local_path, f"/Live Market Data/{bar.symbol}_live.csv")
+
+    # Resample and upload 5-min file
+    out_path = resample_to_5min(bar.symbol)
+    upload_to_dropbox(bar.symbol, out_path, f"/Live Market Data/{bar.symbol}_live_5min.csv")
+
+def start_stream():
+    global wss_client
+    print("Starting stream...")
+    for f in os.listdir(CSV_DIR):
+        if f.endswith(".csv"):
+            os.remove(os.path.join(CSV_DIR, f))
+    print("Cleared local CSV files.")
+    wss_client = StockDataStream(API_KEY, SECRET_KEY)
+    wss_client.subscribe_bars(bar_handler, *SYMBOLS)
+    t = threading.Thread(target=wss_client.run, daemon=True)
+    t.start()
+def stop_stream():
+    global wss_client
+    if wss_client:
+        print("Stopping stream...")
+        wss_client.close()
+
+# 9:30am Eastern = 13:30 UTC
+# 4:02pm Eastern = 20:02 UTC
+for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+    getattr(schedule.every(), day).at("13:30").do(start_stream)
+    getattr(schedule.every(), day).at("20:01").do(stop_stream)
+
+print("Scheduler running, waiting for market hours...")
+while True:
+    schedule.run_pending()
+    time.sleep(1)
