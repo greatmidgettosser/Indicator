@@ -92,14 +92,17 @@ def start_stream():
         if f.endswith(".csv"):
             fpath = os.path.join(CSV_DIR, f)
             try:
-                df = pd.read_csv(fpath, usecols=['timestamp'])
+                df = pd.read_csv(fpath)
                 if len(df) == 0:
                     os.remove(fpath)
                     continue
-                last_date = pd.to_datetime(df['timestamp']).dt.date.iloc[-1]
-                if last_date < today:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df[df['timestamp'].dt.date == today]
+                if len(df) == 0:
                     os.remove(fpath)
-                    print(f"Cleared old data: {f}")
+                else:
+                    df.to_csv(fpath, index=False)
+                    print(f"Cleaned old rows from: {f}")
             except Exception as e:
                 print(f"Error clearing {f}: {e}")
                 os.remove(fpath)
@@ -108,6 +111,7 @@ def start_stream():
     wss_client.subscribe_bars(bar_handler, *SYMBOLS)
     t = threading.Thread(target=wss_client.run, daemon=True)
     t.start()
+
 def stop_stream():
     global wss_client
     if wss_client:
@@ -117,7 +121,7 @@ def stop_stream():
 # 9:30am Eastern = 13:30 UTC
 # 4:02pm Eastern = 20:02 UTC
 for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
-    getattr(schedule.every(), day).at("14:21").do(start_stream)
+    getattr(schedule.every(), day).at("13:30").do(start_stream)
     getattr(schedule.every(), day).at("20:01").do(stop_stream)
 
 print("Scheduler running, waiting for market hours...")
