@@ -20,10 +20,13 @@ DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 APP_KEY_DBX           = os.getenv("APP_KEY_DBX")
 APP_SECRET_DBX        = os.getenv("APP_SECRET_DBX")
 
-SYMBOLS    = ["SPY", "QQQ", "IWM", "AAPL", "AMZN", "PLTR", "TSLA", "IBIT", "SLV", "NVDA", "MSFT", "META", "MARA", "GOOGL", "GLD", "SMCI"]
-CSV_DIR    = "/home/ubuntu/alpaca-stream/live_data"
-eastern    = pytz.timezone("America/New_York")
+SYMBOLS  = ["SPY","QQQ","IWM","AAPL","AMZN","PLTR","TSLA","IBIT","SLV","NVDA",
+            "MSFT","META","MARA","GOOGL","AMD","ARM","GLD","SMCI","MU","SNDK",
+            "DELL","INTC"]
+CSV_DIR  = "/home/ubuntu/alpaca-stream/live_data"
+eastern  = pytz.timezone("America/New_York")
 wss_client = None
+bar_queue  = asyncio.Queue()   # <-- bars go here instantly, processed separately
 
 os.makedirs(CSV_DIR, exist_ok=True)
 
@@ -61,28 +64,41 @@ def resample_to_5min(symbol):
         print(f"Resample error for {symbol}: {e}")
     return out_path
 
+# ---- FAST: just enqueue, never blocks the websocket ----
 async def bar_handler(bar):
-    local_path = f"{CSV_DIR}/{bar.symbol}_live.csv"
-    ts_eastern = bar.timestamp.astimezone(eastern)
-    row = {
-        "timestamp": ts_eastern,
-        "open":      bar.open,
-        "high":      bar.high,
-        "low":       bar.low,
-        "close":     bar.close,
-        "volume":    bar.volume,
-        "vwap":      getattr(bar, "vwap", None)
-    }
-    df = pd.DataFrame([row])
-    df.to_csv(local_path, mode="a", header=not os.path.exists(local_path), index=False)
-    print(f"Bar saved: {bar.symbol} {ts_eastern}")
+    await bar_queue.put(bar)
 
-    # Upload 1-min file
-    upload_to_dropbox(bar.symbol, local_path, f"/Live Market Data/{bar.symbol}_live.csv")
+# ---- SLOW: all the heavy work happens here, off the receive loop ----
+async def bar_processor():
+    while True:
+        bar = await bar_queue.get()
+        try:
+            local_path = f"{CSV_DIR}/{bar.symbol}_live.csv"
+            ts_eastern = bar.timestamp.astimezone(eastern)
+            row = {
+                "timestamp": ts_eastern,
+                "open":      bar.open,
+                "high":      bar.high,
+                "low":       bar.low,
+                "close":     bar.close,
+                "volume":    bar.volume,
+                "vwap":      getattr(bar, "vwap", None)
+            }
+            df = pd.DataFrame([row])
+            df.to_csv(local_path, mode="a", header=not os.path.exists(local_path), index=False)
+            print(f"Bar saved: {bar.symbol} {ts_eastern}")
 
-    # Resample and upload 5-min file
-    out_path = resample_to_5min(bar.symbol)
-    upload_to_dropbox(bar.symbol, out_path, f"/Live Market Data/{bar.symbol}_live_5min.csv")
+            # Run blocking Dropbox calls in a thread so async loop stays free
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, upload_to_dropbox, bar.symbol, local_path,
+                                       f"/Live Market Data/{bar.symbol}_live.csv")
+            out_path = resample_to_5min(bar.symbol)
+            await loop.run_in_executor(None, upload_to_dropbox, bar.symbol, out_path,
+                                       f"/Live Market Data/{bar.symbol}_live_5min.csv")
+        except Exception as e:
+            print(f"Processor error for {bar.symbol}: {e}")
+        finally:
+            bar_queue.task_done()
 
 def start_stream():
     global wss_client
@@ -106,11 +122,19 @@ def start_stream():
             except Exception as e:
                 print(f"Error clearing {f}: {e}")
                 os.remove(fpath)
+
     print("Old CSV files cleared, today's data preserved.")
+
+    # Start the processor in the background event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(bar_processor())
+
     wss_client = StockDataStream(API_KEY, SECRET_KEY)
     wss_client.subscribe_bars(bar_handler, *SYMBOLS)
-    t = threading.Thread(target=wss_client.run, daemon=True)
-    t.start()
+
+    # Run the stream (blocks this thread, but processor runs alongside it)
+    loop.run_until_complete(wss_client._run_forever())
 
 def stop_stream():
     global wss_client
@@ -118,10 +142,10 @@ def stop_stream():
         print("Stopping stream...")
         wss_client.close()
 
-# 9:30am Eastern = 13:30 UTC
-# 4:02pm Eastern = 20:02 UTC
-for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
-    getattr(schedule.every(), day).at("13:30").do(start_stream)
+for day in ["monday","tuesday","wednesday","thursday","friday"]:
+    getattr(schedule.every(), day).at("13:30").do(
+        lambda: threading.Thread(target=start_stream, daemon=True).start()
+    )
     getattr(schedule.every(), day).at("20:01").do(stop_stream)
 
 print("Scheduler running, waiting for market hours...")
