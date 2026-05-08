@@ -22,7 +22,7 @@ APP_SECRET_DBX        = os.getenv("APP_SECRET_DBX")
 
 SYMBOLS  = ["SPY","QQQ","IWM","AAPL","AMZN","PLTR","TSLA","IBIT","SLV","NVDA",
             "MSFT","META","MARA","GOOGL","AMD","ARM","GLD","SMCI","MU","SNDK",
-            "DELL","INTC"]
+            "DELL","INTC", "RKLB", "CRCL", "NFLX", "IREN", "TTD", "CVNA", "USO", "NOK"]
 CSV_DIR  = "/home/ubuntu/alpaca-stream/live_data"
 eastern  = pytz.timezone("America/New_York")
 wss_client = None
@@ -139,7 +139,7 @@ def stop_stream():
         wss_client.close()
 
 for day in ["monday","tuesday","wednesday","thursday","friday"]:
-    getattr(schedule.every(), day).at("14:14").do(
+    getattr(schedule.every(), day).at("13:30").do(
         lambda: threading.Thread(target=start_stream, daemon=True).start()
     )
     getattr(schedule.every(), day).at("20:01").do(stop_stream)
