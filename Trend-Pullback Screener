@@ -7,7 +7,7 @@ from bar_utils import load_bars
 
 warnings.filterwarnings("ignore")
 
-DATA_DIR   = "C:/Users/Justin/Dropbox/Live Market Data"  ## Replace this line with actual file location for your external data
+DATA_DIR   = "C:/Users/Justin/Dropbox/Live Market Data"    #### Replace this line with the actual file location for your external data
 RANK_BY    = "5min"   # "1min" or "5min"
 
 DELTA_MODE = True    # True = show score change over N bars; False = normal mode
@@ -23,7 +23,7 @@ CLOUD_PROXIMITY_PCT_5M = 0.1  # highlight Cloud Distance yellow when Price/SpanB
 # ── 1m Cloud parameters ──────────────────────────────────────────────────────
 CLOUD_SENKOU_B_1M      = 30   # SenkouB lookback period (1m bars)
 CLOUD_MIN_BARS_1M      = 30    # minimum 1m bars before cloud is calculated (warmup only)
-CLOUD_PROXIMITY_PCT_1M = 0.1  # highlight Cloud Distance yellow when Price/SpanB are within this %
+CLOUD_PROXIMITY_PCT_1M = 0.05  # highlight Cloud Distance yellow when Price/SpanB are within this %
 
 CLOUD_DIST_SHOW_PCT = False   # True = show "1.23(0.45%)"  False = show "1.23" only
 
@@ -243,12 +243,10 @@ def _calc_tier(cloud_dir, ema_dir, vwap_confirms, in_pullback):
         return 1
     elif trend_agrees and in_pullback:
         return 2
-    elif trend_agrees and vwap_confirms:
-        return 3
     elif trend_agrees:
-        return 4
+        return 3
     else:
-        return 5
+        return 4
 def score_pullback(df_5m, df_1m):
     if len(df_5m) < CLOUD_MIN_BARS_5M or len(df_1m) < CLOUD_MIN_BARS_1M:
         return None
@@ -311,6 +309,7 @@ def score_pullback(df_5m, df_1m):
         vwap_confirms_1m = False
         in_pullback_1m   = False
 
+
     # ── Tiers ──
     tier_5m = _calc_tier(cloud_dir_5m, ema_dir, vwap_confirms_5m, in_pullback_5m)
     tier_1m = _calc_tier(cloud_dir_1m, ema_dir, vwap_confirms_1m, in_pullback_1m)
@@ -321,6 +320,15 @@ def score_pullback(df_5m, df_1m):
 
     cloud_dist_1m     = round(abs(last_close - span_b_1m), 2)
     cloud_dist_1m_pct = round(cloud_dist_1m / last_close * 100, 2) if last_close else 0.0
+
+    # ── Pullback proximity (secondary sort key) ──
+    # Positive = deeper in pullback zone; negative = outside but approaching
+    if ema_dir == "Bullish":
+        pullback_proximity = 45 - rsi_1m   # >0 when rsi<45 (in zone), <0 when above
+    elif ema_dir == "Bearish":
+        pullback_proximity = rsi_1m - 55   # >0 when rsi>55 (in zone), <0 when below
+    else:
+        pullback_proximity = 0.0
 
     return {
         # 5m cloud
@@ -346,6 +354,8 @@ def score_pullback(df_5m, df_1m):
         "vwap_dist"         : vwap_dist,
         "rsi_1m"            : rsi_1m,
         "last_close"        : last_close,
+        "pullback_proximity": round(pullback_proximity, 1),
+
     }
 GREEN  = "\033[92m"
 RED    = "\033[91m"
@@ -516,8 +526,10 @@ def run_screener():
     if pullback_results:
         # Sort by the tier that matches RANK_BY
         tier_key = "tier_5m" if RANK_BY == "5min" else "tier_1m"
-        pullback_results = sorted(pullback_results, key=lambda x: x[tier_key])
-
+        pullback_results = sorted(
+            pullback_results,
+            key=lambda x: (x[tier_key], -x["pullback_proximity"])
+        )
         # Column widths — cloud dist cells are wider to fit "12.34 (0.56%)"
         WP = dict(
             rank   = 4,
