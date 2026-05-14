@@ -1,0 +1,62 @@
+import pandas as pd
+from datetime import datetime, timezone
+import pytz
+
+def load_bars(filepath, filter_incomplete=True, bar_minutes=5, buffer_seconds=20, datetime_col='timestamp'):
+    """
+    Load bar data from a CSV file.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the CSV file. Must have a 'timestamp' column (Eastern time).
+    datetime_col : str, default 'timestamp'
+        Name of the datetime column in the CSV.
+    filter_incomplete : bool, default True
+        If True, drops the most recent bar if the full bar + buffer hasn't
+        elapsed yet. Set to False to load the raw file exactly as-is.
+    bar_minutes : int, default 5
+        The bar timeframe in minutes.
+    buffer_seconds : int, default 20
+        Extra seconds to wait past bar close before treating it as complete.
+        Accounts for datafeed/resample lag.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame indexed by datetime (timezone-aware, Eastern).
+    """
+    eastern = pytz.timezone("US/Eastern")
+
+    df = pd.read_csv(filepath, parse_dates=[datetime_col], index_col=datetime_col)
+
+    # Localize index to Eastern if it came in naive
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(eastern)
+
+    # Drop pre-market bars before any incomplete-bar logic
+    from datetime import time as dt_time
+    df = df[df.index.time >= dt_time(9, 30)]
+
+    if not filter_incomplete:
+        return df
+
+    # Current time anchored to UTC, converted to Eastern — avoids any
+    # local machine timezone dependency (Mountain, Pacific, etc.)
+    now_eastern = datetime.now(timezone.utc).astimezone(eastern)
+
+    last_bar_start = df.index[-1]
+    bar_close_plus_buffer = last_bar_start + pd.Timedelta(
+        minutes=bar_minutes, seconds=buffer_seconds
+    )
+
+    if now_eastern < bar_close_plus_buffer:
+        dropped_bar = last_bar_start.strftime("%Y-%m-%d %H:%M %Z")
+        print(
+            f"[bar_utils] Incomplete bar dropped: {dropped_bar} "
+            f"(closes at {bar_close_plus_buffer.strftime('%H:%M:%S %Z')}, "
+            f"current time {now_eastern.strftime('%H:%M:%S %Z')})"
+        )
+        df = df.iloc[:-1]
+
+    return df
