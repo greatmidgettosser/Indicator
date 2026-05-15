@@ -7,10 +7,10 @@ from bar_utils import load_bars
 
 warnings.filterwarnings("ignore")
 
-DATA_DIR   = "C:/Users/Justin/Dropbox/Live Market Data"    #### Replace this line with the actual file location for your external data
+DATA_DIR   = "C:/Users/Justin/Dropbox/Live Market Data"
 RANK_BY    = "5min"   # "1min" or "5min"
 
-DELTA_MODE = True    # True = show score change over N bars; False = normal mode
+DELTA_MODE = False    # True = show score change over N bars; False = normal mode
 DELTA_BARS = 6        # number of bars to look back when DELTA_MODE is True
 
 PCT_LOOKBACK = 20     # number of 1min bars to look back for % change table
@@ -30,9 +30,9 @@ CLOUD_DIST_SHOW_PCT = False   # True = show "1.23(0.45%)"  False = show "1.23" o
 WEIGHTS = {
     "ema_stack" : 0.30,
     "adx"       : 0.25,
-    "macd"      : 0.20,
-    "rsi"       : 0.15,
-    "roc"       : 0.10,
+    "rsi"       : 0.20,
+    "roc"       : 0.15,
+    "macd"      : 0.10,
 }
 
 def calc_ema(series, period):
@@ -93,11 +93,15 @@ def get_direction(ema8, ema21, ema50):
     elif ema8 < ema21 < ema50:
         return "Bearish"
     return "Neutral"
-def score_df(df, tail_offset=0):
+def score_df(df, tail_offset=0, rsi_df=None):
     if tail_offset > 0:
         if len(df) <= tail_offset:
             return None
         df = df.iloc[:-tail_offset].copy()
+        if rsi_df is not None:
+            if len(rsi_df) <= tail_offset:
+                return None
+            rsi_df = rsi_df.iloc[:-tail_offset].copy()
 
     if len(df) < 5:
         return None
@@ -144,20 +148,21 @@ def score_df(df, tail_offset=0):
     else:
         macd_score = 30 if abs(hist_now) > abs(hist_prev) else 10
 
-    rsi_val = calc_rsi(close).iloc[-1]
+    rsi_series = rsi_df["close"] if rsi_df is not None else close
+    rsi_val = calc_rsi(rsi_series).iloc[-1]
 
     if direction == "Bullish":
-        if 50 <= rsi_val <= 65:       rsi_score = 100
-        elif 65 < rsi_val <= 75:      rsi_score = 70
-        elif 45 <= rsi_val < 50:      rsi_score = 55
-        elif rsi_val > 75:            rsi_score = 30
-        else:                         rsi_score = 10
+        if 45 <= rsi_val <= 70:       rsi_score = 100
+        elif 70 < rsi_val <= 80:      rsi_score = 70
+        elif 40 <= rsi_val < 45:      rsi_score = 55
+        elif rsi_val > 80:            rsi_score = 40
+        else:                         rsi_score = 15
     elif direction == "Bearish":
-        if 35 <= rsi_val <= 50:       rsi_score = 100
-        elif 25 <= rsi_val < 35:      rsi_score = 70
-        elif 50 < rsi_val <= 55:      rsi_score = 55
-        elif rsi_val < 25:            rsi_score = 30
-        else:                         rsi_score = 10
+        if 30 <= rsi_val <= 55:       rsi_score = 100
+        elif 20 <= rsi_val < 30:      rsi_score = 70
+        elif 55 < rsi_val <= 60:      rsi_score = 55
+        elif rsi_val < 20:            rsi_score = 40
+        else:                         rsi_score = 15
     else:
         rsi_score = 40 if 40 <= rsi_val <= 60 else 15
 
@@ -393,7 +398,7 @@ def run_screener():
 
         # ── Original screener ──
         r1 = score_df(df_1m)
-        r5 = score_df(df_5m)
+        r5 = score_df(df_5m, rsi_df=df_1m)
 
         if r1 is None or r5 is None:
             print(f"  [{symbol}] Skipped — insufficient rows after 9:30 filter")
@@ -401,7 +406,7 @@ def run_screener():
 
         if DELTA_MODE:
             r1_past = score_df(df_1m, tail_offset=DELTA_BARS)
-            r5_past = score_df(df_5m, tail_offset=DELTA_BARS)
+            r5_past = score_df(df_5m, tail_offset=DELTA_BARS, rsi_df=df_1m)
             if r1_past is None or r5_past is None:
                 print(f"  [{symbol}] Skipped — insufficient bars for delta lookback ({DELTA_BARS})")
                 continue
