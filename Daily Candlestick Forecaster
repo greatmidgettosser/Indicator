@@ -1,0 +1,423 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import pearsonr
+from scipy.stats import gaussian_kde
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from pathlib import Path
+
+CSV_PATH        = "Alpaca/IWM_Daily.csv"  # path to your daily OHLCV CSV
+LOOKBACK        = 5                # candles in the matching window
+TOP_N           = 25                # number of top matches to keep
+MIN_SCORE       = 0.25              # minimum combined score to include a match
+HORIZONS        = [1, 2, 3]        # forecast horizons in trading days
+BULL_THRESH     = 0.099              # % move threshold for bull / bear / neutral
+SAVE_PNG        = False
+
+MAX_LOOKBACK_DAYS = 1000  # only match against the most recent N trading days
+PRIMARY_STAT    = "median"            # "mean" | "median"
+
+W_DIRECTION  = 0.30   # bull (+1) or bear (-1) sequence — arguably the most important
+W_BODY_PCT   = 0.25   # body size relative to full range (how much of candle is body)
+W_REL_RANGE  = 0.15   # candle range relative to window (volatility shape)
+W_UPPER_WICK = 0.10   # upper shadow ratio (rejection of highs)
+W_LOWER_WICK = 0.10   # lower shadow ratio (rejection of lows)
+W_CLOSE_POS  = 0.05
+W_OPEN_POS   = 0.05
+
+assert abs(W_BODY_PCT + W_DIRECTION + W_UPPER_WICK + W_LOWER_WICK + W_REL_RANGE + W_CLOSE_POS + W_OPEN_POS - 1.0) < 1e-9, \
+    "Candle feature weights must sum to 1.0"
+
+TEXT   = "#d3d1c7"
+MUTED  = "#888780"
+GRID   = "#2e2e2b"
+BULL   = "#639922"
+BEAR   = "#e24b4a"
+NEUT   = "#ba7517"
+BLUE   = "#378add"
+CURR   = "#c0dd97"
+BG     = "#1c1c1a"
+
+def load_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.strip().str.lower()
+    col_map = {}
+    for col in df.columns:
+        if "date" in col or "time" in col:  col_map[col] = "date"
+        elif col in ("open",  "o"):         col_map[col] = "open"
+        elif col in ("high",  "h"):         col_map[col] = "high"
+        elif col in ("low",   "l"):         col_map[col] = "low"
+        elif col in ("close", "c", "last"): col_map[col] = "close"
+        elif "vol" in col:                  col_map[col] = "volume"
+    df = df.rename(columns=col_map)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    return df
+def extract_candle_features(opens: np.ndarray, highs: np.ndarray,
+                            lows: np.ndarray, closes: np.ndarray) -> dict:
+    full_range = highs - lows
+    full_range = np.where(full_range == 0, 1e-8, full_range)
+
+    body        = np.abs(closes - opens)
+    body_pct    = body / full_range
+
+    direction   = np.where(closes >= opens, 1.0, -1.0)
+
+    upper_wick  = (highs - np.maximum(opens, closes)) / full_range
+    lower_wick  = (np.minimum(opens, closes) - lows)  / full_range
+
+    w_rng       = full_range
+    rng_min, rng_max = w_rng.min(), w_rng.max()
+    rel_range   = (w_rng - rng_min) / (rng_max - rng_min + 1e-8)
+
+    window_high = highs.max()
+    window_low = lows.min()
+    window_rng = window_high - window_low or 1e-8
+
+    close_position = (closes - window_low) / window_rng  # where close sits in full window range
+    open_position = (opens - window_low) / window_rng
+
+    return {
+        "body_pct"  : body_pct,
+        "direction" : direction,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "rel_range" : rel_range,
+        "close_position": close_position,
+        "open_position": open_position,
+    }
+def safe_pearsonr(a: np.ndarray, b: np.ndarray) -> float:
+    if a.std() < 1e-10 or b.std() < 1e-10:
+        return 0.0
+    r, _ = pearsonr(a, b)
+    return float(r)
+def score_candle_window(cur, hist):
+    r_body = safe_pearsonr(cur["body_pct"], hist["body_pct"])
+    r_dir = safe_pearsonr(cur["direction"], hist["direction"])
+    r_upper = safe_pearsonr(cur["upper_wick"], hist["upper_wick"])
+    r_lower = safe_pearsonr(cur["lower_wick"], hist["lower_wick"])
+    r_range = safe_pearsonr(cur["rel_range"], hist["rel_range"])
+    r_cpos = safe_pearsonr(cur["close_position"], hist["close_position"])
+    r_opos = safe_pearsonr(cur["open_position"], hist["open_position"])
+
+    raw_scores = np.array([r_body, r_dir, r_upper, r_lower, r_range, r_cpos, r_opos])
+    weights = np.array([W_BODY_PCT, W_DIRECTION, W_UPPER_WICK, W_LOWER_WICK, W_REL_RANGE, W_CLOSE_POS, W_OPEN_POS])
+
+    composite = float(np.dot(weights, raw_scores))
+
+    # penalize disagreement between features
+    consistency = 1.0 - np.std(raw_scores) * 0.5  # discount up to 50% for high variance
+    return composite * max(consistency, 0.5)
+def find_matches(df: pd.DataFrame) -> list[dict]:
+    opens  = df["open"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+    closes = df["close"].values
+
+    cur_feats    = extract_candle_features(
+        opens[-LOOKBACK:], highs[-LOOKBACK:],
+        lows[-LOOKBACK:],  closes[-LOOKBACK:])
+    current_date = df["date"].iloc[-1]
+
+    max_start = len(df) - LOOKBACK - max(HORIZONS)
+    min_start = max(0, len(df) - LOOKBACK - MAX_LOOKBACK_DAYS)
+    matches = []
+
+    for i in range(min_start, max_start + 1):
+        end_idx = i + LOOKBACK - 1
+        if df["date"].iloc[end_idx] >= current_date:
+            continue
+
+        w_o = opens [i : i + LOOKBACK]
+        w_h = highs [i : i + LOOKBACK]
+        w_l = lows  [i : i + LOOKBACK]
+        w_c = closes[i : i + LOOKBACK]
+
+        try:
+            hist_feats = extract_candle_features(w_o, w_h, w_l, w_c)
+            score      = score_candle_window(cur_feats, hist_feats)
+        except Exception:
+            continue
+
+        if score < MIN_SCORE:
+            continue
+
+        base_close = closes[end_idx]
+        fwd   = {}
+        valid = True
+        for h in HORIZONS:
+            fi = end_idx + h
+            if fi >= len(df):
+                valid = False
+                break
+            fwd[h] = (closes[fi] - base_close) / base_close * 100
+        if not valid:
+            continue
+
+        price_min = w_l.min()
+        price_rng = w_h.max() - price_min or 1.0
+
+        matches.append({
+            "date"  : df["date"].iloc[end_idx].strftime("%Y-%m-%d"),
+            "score" : round(score, 4),
+            "fwd"   : fwd,
+            "feats" : hist_feats,
+            "ohlc"  : {
+                "o": (w_o - price_min) / price_rng,
+                "h": (w_h - price_min) / price_rng,
+                "l": (w_l - price_min) / price_rng,
+                "c": (w_c - price_min) / price_rng,
+            },
+        })
+
+    matches.sort(key=lambda x: x["score"], reverse=True)
+    return matches[:TOP_N], cur_feats
+def compute_forecasts(matches: list[dict]) -> dict:
+    scores  = np.array([m["score"] for m in matches])
+    weights = np.exp(scores * 3)  # exponential — heavily favors top matches
+    weights = weights / weights.sum()
+    results = {}
+    for h in HORIZONS:
+        arr  = np.array([m["fwd"][h] for m in matches])
+        bull = np.sum(weights[arr >  BULL_THRESH]) * 100
+        bear = np.sum(weights[arr < -BULL_THRESH]) * 100
+        neut = 100 - bull - bear
+
+        w_mean   = np.sum(weights * arr)
+        order    = np.argsort(arr)
+        cum_w    = np.cumsum(weights[order])
+        w_median = arr[order][np.searchsorted(cum_w, 0.5)]
+        w_std    = np.sqrt(np.sum(weights * (arr - w_mean) ** 2))
+
+        results[h] = {
+            "bull"   : bull,   "bear"  : bear,  "neut" : neut,
+            "median" : w_median, "mean": w_mean, "std"  : w_std,
+            "moves"  : arr,    "weights": weights,
+        }
+    return results
+def draw_candles(ax, x_positions, opens, highs, lows, closes,
+                 bull_color=BULL, bear_color=BEAR,
+                 alpha=1.0, body_width=0.6, wick_lw=1.0):
+    for i, x in enumerate(x_positions):
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        color = bull_color if c >= o else bear_color
+
+        ax.plot([x, x], [l, h], color=color, linewidth=wick_lw,
+                alpha=alpha, zorder=2, solid_capstyle="round")
+
+        body_bot = min(o, c)
+        body_h   = max(abs(c - o), 0.003)
+        rect = mpatches.FancyBboxPatch(
+            (x - body_width / 2, body_bot), body_width, body_h,
+            boxstyle="square,pad=0",
+            facecolor=color, edgecolor=color,
+            alpha=alpha, zorder=3,
+        )
+        ax.add_patch(rect)
+def plot_results(matches: list[dict], cur_feats: dict,
+                 forecasts: dict, df: pd.DataFrame):
+
+    n_horizons = len(HORIZONS)
+    fig = plt.figure(figsize=(18, 11))
+    fig.patch.set_facecolor(BG)
+    gs = gridspec.GridSpec(2, max(n_horizons, 3), figure=fig, hspace=0.48, wspace=0.35)
+
+    def style_ax(ax, title=""):
+        ax.set_facecolor(BG)
+        ax.tick_params(colors=MUTED, labelsize=9)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(GRID)
+        if title:
+            ax.set_title(title, color=TEXT, fontsize=10, pad=8)
+        ax.grid(True, color=GRID, linewidth=0.5)
+
+    # ── Panel 0 (wide): candlestick overlay ──────────────────────────────
+    # Use first two columns for the overlay, last column for features
+    ax0 = fig.add_subplot(gs[0, :max(n_horizons - 1, 2)])
+    style_ax(ax0, "Candlestick overlay — current vs top matches (normalized 0–1)")
+    ax0.set_xlabel("Day in window", color=MUTED, fontsize=9)
+    ax0.set_ylabel("Norm price  (0–1 per window)", color=MUTED, fontsize=9)
+
+    x = np.arange(LOOKBACK, dtype=float)
+
+    for m in matches:
+        ohlc = m["ohlc"]
+        draw_candles(ax0, x,
+                     opens=ohlc["o"], highs=ohlc["h"],
+                     lows=ohlc["l"],  closes=ohlc["c"],
+                     bull_color=BULL, bear_color=BEAR,
+                     alpha=0.12, body_width=0.55, wick_lw=0.6)
+
+    avg_close = np.mean([m["ohlc"]["c"] for m in matches], axis=0)
+    ax0.plot(x, avg_close, color=BLUE, lw=1.2, ls="--",
+             label="Avg match close", zorder=4, alpha=0.8)
+
+    c_h = df["high"].values[-LOOKBACK:]
+    c_l = df["low"].values[-LOOKBACK:]
+    c_o = df["open"].values[-LOOKBACK:]
+    c_c = df["close"].values[-LOOKBACK:]
+    pm  = c_l.min()
+    pr  = c_h.max() - pm or 1.0
+
+    draw_candles(ax0, x,
+                 opens  = (c_o - pm) / pr,
+                 highs  = (c_h - pm) / pr,
+                 lows   = (c_l - pm) / pr,
+                 closes = (c_c - pm) / pr,
+                 bull_color="#9fdd55", bear_color="#ff6b6a",
+                 alpha=1.0, body_width=0.65, wick_lw=1.8)
+
+    ax0.set_xlim(-0.8, LOOKBACK - 0.2)
+    ax0.set_xticks(range(LOOKBACK))
+    ax0.set_xticklabels([f"D{i+1}" for i in range(LOOKBACK)], fontsize=8)
+
+    ghost  = mpatches.Patch(color=BLUE,     alpha=0.45, label="Historical matches")
+    c_bull = mpatches.Patch(color="#9fdd55",             label="Current (bull candle)")
+    c_bear = mpatches.Patch(color="#ff6b6a",             label="Current (bear candle)")
+    ax0.legend(handles=[ghost, c_bull, c_bear],
+               fontsize=9, facecolor="#252523", labelcolor=TEXT, framealpha=0.8)
+
+    # ── Panel 1: per-feature correlation breakdown ────────────────────────
+    ax1 = fig.add_subplot(gs[0, -1])
+    style_ax(ax1, "Per-feature avg correlation\n(current vs all matches)")
+    ax1.set_xlabel("Avg Pearson r", color=MUTED, fontsize=9)
+
+    feat_names   = ["Body %", "Direction", "Upper wick", "Lower wick", "Rel range"]
+    feat_keys    = ["body_pct", "direction", "upper_wick", "lower_wick", "rel_range"]
+    feat_weights = [W_BODY_PCT, W_DIRECTION, W_UPPER_WICK, W_LOWER_WICK, W_REL_RANGE]
+
+    avg_r = []
+    for k in feat_keys:
+        rs = [safe_pearsonr(cur_feats[k], m["feats"][k]) for m in matches]
+        avg_r.append(np.mean(rs))
+
+    colors = [BULL if r > 0 else BEAR for r in avg_r]
+    bars   = ax1.barh(feat_names, avg_r, color=colors, alpha=0.75, edgecolor=GRID)
+    ax1.axvline(0,    color=MUTED,   lw=0.8)
+    ax1.axvline(0.55, color="#f5c518", lw=1.2, ls=":", label="Threshold 0.55")
+    ax1.legend(fontsize=8, facecolor="#252523", labelcolor=TEXT, framealpha=0.8)
+    ax1.set_xlim(-1.05, 1.05)
+
+    for bar, r, w in zip(bars, avg_r, feat_weights):
+        xpos = r + (0.05 if r >= 0 else -0.05)
+        ha   = "left" if r >= 0 else "right"
+        ax1.text(xpos, bar.get_y() + bar.get_height() / 2,
+                 f"r={r:+.2f}  w={w:.0%}",
+                 va="center", ha=ha, fontsize=8, color=TEXT)
+
+    ax1.tick_params(axis="y", labelsize=9, labelcolor=TEXT)
+    ax1.set_yticklabels(feat_names, color=TEXT)
+
+    # ── Panels: forward return distributions (one per horizon) ────────────
+    for col, h in enumerate(HORIZONS):
+        ax  = fig.add_subplot(gs[1, col])
+        style_ax(ax, f"+{h} day{'s' if h > 1 else ''} forward returns")
+        ax.set_xlabel("% move", color=MUTED, fontsize=9)
+
+        f       = forecasts[h]
+        moves   = f["moves"]
+        weights = f["weights"]
+
+        if len(moves) > 3:
+            kde = gaussian_kde(moves, bw_method=0.4, weights=weights)
+            xs  = np.linspace(moves.min() - 0.5, moves.max() + 0.5, 200)
+            ys  = kde(xs)
+            ax.fill_between(xs, ys, alpha=0.25, color=BLUE)
+            ax.plot(xs, ys, color=BLUE, lw=1.2)
+
+        med_lw = 2.0 if PRIMARY_STAT == "median" else 1.0
+        avg_lw = 2.0 if PRIMARY_STAT == "mean"   else 1.0
+        med_alpha = 1.0 if PRIMARY_STAT == "median" else 0.45
+        avg_alpha = 1.0 if PRIMARY_STAT == "mean"   else 0.45
+
+        ax.axvline(0,          color=MUTED, lw=0.8, ls="--")
+        ax.axvline(f["median"], color=CURR, lw=med_lw, ls="--", alpha=med_alpha,
+                   label=f"Med {f['median']:+.2f}%" + (" ◀ primary" if PRIMARY_STAT == "median" else ""))
+        ax.axvline(f["mean"],   color=NEUT, lw=avg_lw, ls=":",  alpha=avg_alpha,
+                   label=f"Avg {f['mean']:+.2f}%"    + (" ◀ primary" if PRIMARY_STAT == "mean"   else ""))
+
+        sizes = weights / weights.max() * 40 + 8
+        ax.scatter(moves,
+                   np.random.uniform(-0.005, 0.005, len(moves)),
+                   c=[BULL if v > BULL_THRESH else BEAR if v < -BULL_THRESH else NEUT for v in moves],
+                   s=sizes, alpha=0.75, zorder=5)
+
+        primary   = f[PRIMARY_STAT]
+        dominant = "BULLISH" if primary > BULL_THRESH else "BEARISH" if primary < -BULL_THRESH else "NEUTRAL"
+        dom_color = BULL if dominant == "BULLISH" else BEAR if dominant == "BEARISH" else NEUT
+        ax.text(0.97, 0.95, dominant,
+                transform=ax.transAxes, ha="right", va="top",
+                fontsize=9, fontweight="bold", color=dom_color)
+        ax.text(0.97, 0.82,
+                f"▲{f['bull']:.0f}%  ▼{f['bear']:.0f}%  ●{f['neut']:.0f}%",
+                transform=ax.transAxes, ha="right", va="top",
+                fontsize=8, color=MUTED)
+        ax.legend(fontsize=8, facecolor="#252523", labelcolor=TEXT, framealpha=0.8,
+                  loc="upper left")
+
+    fig.suptitle(
+        f"Candle Pattern Forecast  |  Window: {LOOKBACK}d  |  "
+        f"Matches: {len(matches)}  |  As of {df['date'].iloc[-1].strftime('%Y-%m-%d')}",
+        color=TEXT, fontsize=11, y=0.99,
+    )
+
+    if SAVE_PNG:
+        out = Path(CSV_PATH).stem + "_candle_forecast.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+        print(f"  Chart saved → {out}")
+
+    plt.show()
+def print_summary(matches: list[dict], forecasts: dict, df: pd.DataFrame):
+    scores = [m["score"] for m in matches]
+    print("\n" + "="*62)
+    print(f"  CANDLE PATTERN FORECASTER")
+    print(f"  Window: {LOOKBACK}d  |  Matches: {len(matches)}  |  Min score: {MIN_SCORE}")
+    print(f"  Current window ends: {df['date'].iloc[-1].strftime('%Y-%m-%d')}")
+    print(f"  Avg score: {np.mean(scores):.3f}  |  Min: {np.min(scores):.3f}  |  Max: {np.max(scores):.3f}")
+    print("="*62)
+    for h in HORIZONS:
+        f        = forecasts[h]
+        primary  = f[PRIMARY_STAT]
+        tag = "BULLISH" if primary > BULL_THRESH else "BEARISH" if primary < -BULL_THRESH else "NEUTRAL"
+        print(f"\n  +{h}d  →  {tag}  ({PRIMARY_STAT} {primary:+.2f}%)")
+        print(f"         Bull {f['bull']:5.1f}%  |  Bear {f['bear']:5.1f}%  |  Neutral {f['neut']:5.1f}%")
+        print(f"         Median {f['median']:+.2f}%  |  Std {f['std']:.2f}%")
+    print("\n" + "-"*62)
+
+    # Build header and rows dynamically from HORIZONS
+    horizon_cols = "".join(f"  +{h}d  " if h < 10 else f" +{h}d  " for h in HORIZONS)
+    print(f"  {'#':<3}  {'Date':<12}  {'Score':<7}  {horizon_cols}")
+    print("-"*62)
+    for i, m in enumerate(matches, 1):
+        fmts = {h: f"{m['fwd'][h]:+.2f}%" for h in HORIZONS}
+        fwd_cols = "".join(f"{fmts[h]:>7}  " for h in HORIZONS)
+        print(f"  {i:<3}  {m['date']:<12}  {m['score']:<7.4f}  {fwd_cols}")
+    print("="*62 + "\n")
+def main():
+    print(f"\nLoading {CSV_PATH}…")
+    df = load_data(CSV_PATH)
+    print(f"Loaded {len(df)} rows  ({df['date'].iloc[0].date()} → {df['date'].iloc[-1].date()})")
+
+    required_cols = {"open", "high", "low", "close"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV is missing columns: {missing}. OHLC data is required for candle scoring.")
+
+    min_rows = LOOKBACK + max(HORIZONS) + 10
+    if len(df) < min_rows:
+        raise ValueError(f"Need at least {min_rows} rows, got {len(df)}")
+
+    print(f"Scanning for candle pattern matches (lookback={LOOKBACK}d, top_n={TOP_N}, min_score={MIN_SCORE})…")
+    matches, cur_feats = find_matches(df)
+
+    if not matches:
+        print("No matches found above MIN_SCORE threshold. Try lowering MIN_SCORE.")
+        return
+
+    forecasts = compute_forecasts(matches)
+    print_summary(matches, forecasts, df)
+    plot_results(matches, cur_feats, forecasts, df)
+if __name__ == "__main__":
+    main()
