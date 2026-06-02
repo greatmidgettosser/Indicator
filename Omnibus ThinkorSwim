@@ -1,0 +1,71 @@
+# ============================================================
+# Omnibus Signal Dots
+# Long  (green dot below bar): Waddah Up + Linda MACD > 0 + Hull Up + SAR below close
+# Short (red dot above bar):   Waddah Down + Linda MACD < 0 + Hull Down + SAR above close
+# ============================================================
+
+# ── Inputs ───────────────────────────────────────────────────
+input HullPeriod     = 9;
+input WaddahSens     = 150;
+input WaddahFast     = 20;
+input WaddahSlow     = 40;
+input WaddahBBLen    = 20;
+input WaddahBBMult   = 2.0;
+input SARAccel       = 0.02;
+input SARLimit       = 0.2;
+input LookbackBars   = 25;
+input DotOffset      = 10;
+# ── Parabolic SAR ────────────────────────────────────────────
+def sarValue = ParabolicSAR(SARAccel, SARLimit);
+def bPSARUp   = sarValue < close;
+def bPSARDown = sarValue > close;
+
+# ── Waddah Explosion ─────────────────────────────────────────
+def fastMA    = Average(close, WaddahFast);
+def slowMA    = Average(close, WaddahSlow);
+def macdDiff  = fastMA - slowMA;
+def t1        = (macdDiff - macdDiff[1]) * WaddahSens;
+def bWaddahUp   = t1 >= 0;
+def bWaddahDown = t1 < 0;
+
+# ── Linda MACD (3/10/16 histogram) ───────────────────────────
+def lindaFast   = Average(close, 3);
+def lindaSlow   = Average(close, 10);
+def lindaLine   = lindaFast - lindaSlow;
+def lindaSig    = Average(lindaLine, 16);
+def lindaHist   = lindaLine - lindaSig;
+def bLindaUp    = lindaHist > 0;
+def bLindaDown  = lindaHist < 0;
+
+# ── Hull Moving Average ───────────────────────────────────────
+# HMA = WMA(2*WMA(close, period/2) - WMA(close, period), sqrt(period))
+def halfPer  = Max(1, RoundDown(HullPeriod / 2, 0));
+def sqrtPer  = Max(1, RoundDown(Sqrt(HullPeriod), 0));
+
+def wmaFull  = WMA(close, HullPeriod);
+def wmaHalf  = WMA(close, halfPer);
+def wmaDiff  = 2.0 * wmaHalf - wmaFull;
+def hma      = WMA(wmaDiff, sqrtPer);
+
+def bHullUp   = hma > hma[1];
+def bHullDown = hma < hma[1];
+
+# ── Combined signals ─────────────────────────────────────────
+def longSignal  = bWaddahUp   and bLindaUp   and bHullUp   and bPSARUp;
+def shortSignal = bWaddahDown and bLindaDown and bHullDown and bPSARDown;
+
+# ── Lookback filter ──────────────────────────────────────────
+# Only show signals on the most recent LookbackBars bars
+def barsFromEnd = BarNumber() >= HighestAll(BarNumber()) - LookbackBars;
+
+# ── Plots ────────────────────────────────────────────────────
+plot LongDot  = if barsFromEnd and longSignal  then low  - TickSize() * DotOffset else Double.NaN;
+plot ShortDot = if barsFromEnd and shortSignal then high + TickSize() * DotOffset else Double.NaN;
+
+LongDot.SetPaintingStrategy(PaintingStrategy.POINTS);
+LongDot.SetDefaultColor(Color.GREEN);
+LongDot.SetLineWeight(3);
+
+ShortDot.SetPaintingStrategy(PaintingStrategy.POINTS);
+ShortDot.SetDefaultColor(Color.RED);
+ShortDot.SetLineWeight(3);
