@@ -15,6 +15,9 @@ input SARAccel       = 0.02;
 input SARLimit       = 0.2;
 input LookbackBars   = 25;
 input DotOffset      = 10;
+
+declare once_per_bar;
+
 # ── Parabolic SAR ────────────────────────────────────────────
 def sarValue = ParabolicSAR(SARAccel, SARLimit);
 def bPSARUp   = sarValue < close;
