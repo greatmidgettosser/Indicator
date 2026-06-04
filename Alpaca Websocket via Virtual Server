@@ -138,6 +138,8 @@ def stop_stream():
         print("Stopping stream...")
         wss_client.close()
 
+threading.Thread(target=start_stream, daemon=True).start()
+
 for day in ["monday","tuesday","wednesday","thursday","friday"]:
     getattr(schedule.every(), day).at("13:30").do(
         lambda: threading.Thread(target=start_stream, daemon=True).start()
