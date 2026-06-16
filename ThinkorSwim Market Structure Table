@@ -79,55 +79,80 @@ def sumPPB_L = fold i_l = 1 to LookbackLong + 1 with a_l = 0 do
 def avgPPB_L = sumPPB_L / LookbackLong;
 
 # ── Pivot Structure: upDisp vs downDisp over lookback ────────
-# Track the most recent prior pivot high and low as running values using
-# recursive defs. Each bar we check if a new pivot fired and update accordingly.
-# Displacement is accumulated each time we get a new pivot of either type.
-# The open/partial swing from the last pivot to current price is also included,
-# matching the C# logic: if last pivot was a low, add max(0, close - lastPivLow)
-#                         if last pivot was a high, add max(0, lastPivHigh - close)
+# FIXED: every confirmed pivot is used in exactly one displacement
+# calculation. Pending same-type pivots accumulate in a small stack
+# (pend1..pend6, most recent = pend1). The moment an opposite-type
+# pivot arrives, every pivot in the stack resolves against it — each
+# one exactly once — then the stack clears and restarts.
+# Stack depth capped at 6 consecutive same-type pivots (more than
+# enough in practice; beyond that, oldest entries roll off).
 
-# Last seen pivot high and low (carried forward each bar)
-def lastPivHigh = if !IsNaN(pivHigh) then pivHigh
-                  else if IsNaN(lastPivHigh[1]) then Double.NaN
-                  else lastPivHigh[1];
+def pendType = if isPivHigh then 1
+               else if isPivLow then -1
+               else pendType[1];
 
-def lastPivLow  = if !IsNaN(pivLow) then pivLow
-                  else if IsNaN(lastPivLow[1]) then Double.NaN
-                  else lastPivLow[1];
+def isNewPivot = isPivHigh or isPivLow;
+def isPush     = (isPivHigh and pendType[1] == 1) or (isPivLow and pendType[1] == -1);
+def isSwitch   = isNewPivot and !isPush;
 
-# Track which pivot type fired most recently (1 = high, -1 = low)
-def lastPivType = if !IsNaN(pivHigh) then 1
-                  else if !IsNaN(pivLow) then -1
-                  else lastPivType[1];
+def pend1 = if isNewPivot then cVal else pend1[1];
+def pend2 = if isPush then pend1[1] else if isSwitch then Double.NaN else pend2[1];
+def pend3 = if isPush then pend2[1] else if isSwitch then Double.NaN else pend3[1];
+def pend4 = if isPush then pend3[1] else if isSwitch then Double.NaN else pend4[1];
+def pend5 = if isPush then pend4[1] else if isSwitch then Double.NaN else pend5[1];
+def pend6 = if isPush then pend5[1] else if isSwitch then Double.NaN else pend6[1];
 
-# Running upDisp: each time a new pivot high appears, add max(0, pivHigh - lastPivLow)
-def runUpDisp   = if !IsNaN(pivHigh) and !IsNaN(lastPivLow[1])
-                  then runUpDisp[1] + Max(0, pivHigh - lastPivLow[1])
-                  else runUpDisp[1];
+# New HIGH resolves any pending LOWS into upDisp
+def resolveToUp = if isPivHigh and !IsNaN(pendType[1]) and pendType[1] == -1 then
+    (if IsNaN(pend1[1]) then 0 else Max(0, cVal - pend1[1])) +
+    (if IsNaN(pend2[1]) then 0 else Max(0, cVal - pend2[1])) +
+    (if IsNaN(pend3[1]) then 0 else Max(0, cVal - pend3[1])) +
+    (if IsNaN(pend4[1]) then 0 else Max(0, cVal - pend4[1])) +
+    (if IsNaN(pend5[1]) then 0 else Max(0, cVal - pend5[1])) +
+    (if IsNaN(pend6[1]) then 0 else Max(0, cVal - pend6[1]))
+    else 0;
 
-# Running downDisp: each time a new pivot low appears, add max(0, lastPivHigh - pivLow)
-def runDownDisp = if !IsNaN(pivLow) and !IsNaN(lastPivHigh[1])
-                  then runDownDisp[1] + Max(0, lastPivHigh[1] - pivLow)
-                  else runDownDisp[1];
+# New LOW resolves any pending HIGHS into downDisp
+def resolveToDown = if isPivLow and !IsNaN(pendType[1]) and pendType[1] == 1 then
+    (if IsNaN(pend1[1]) then 0 else Max(0, pend1[1] - cVal)) +
+    (if IsNaN(pend2[1]) then 0 else Max(0, pend2[1] - cVal)) +
+    (if IsNaN(pend3[1]) then 0 else Max(0, pend3[1] - cVal)) +
+    (if IsNaN(pend4[1]) then 0 else Max(0, pend4[1] - cVal)) +
+    (if IsNaN(pend5[1]) then 0 else Max(0, pend5[1] - cVal)) +
+    (if IsNaN(pend6[1]) then 0 else Max(0, pend6[1] - cVal))
+    else 0;
 
-# Open swing from last confirmed pivot to current price
-def openUpDisp   = if lastPivType == -1 and !IsNaN(lastPivLow)
-                   then Max(0, close - lastPivLow)
-                   else 0;
-def openDownDisp = if lastPivType == 1 and !IsNaN(lastPivHigh)
-                   then Max(0, lastPivHigh - close)
-                   else 0;
+def runUpDisp   = if IsNaN(runUpDisp[1])   then resolveToUp   else runUpDisp[1]   + resolveToUp;
+def runDownDisp = if IsNaN(runDownDisp[1]) then resolveToDown else runDownDisp[1] + resolveToDown;
 
-# For each lookback, displacement = (current running + open swing) minus value at lookback bars ago
-def upDisp_S   = (runUpDisp + openUpDisp)   - GetValue(runUpDisp   + openUpDisp,   LookbackShort, 500);
+# Open swing: unresolved pending pivots measured against the live close
+def openUpDisp = if pendType == -1 then
+    (if IsNaN(pend1) then 0 else Max(0, close - pend1)) +
+    (if IsNaN(pend2) then 0 else Max(0, close - pend2)) +
+    (if IsNaN(pend3) then 0 else Max(0, close - pend3)) +
+    (if IsNaN(pend4) then 0 else Max(0, close - pend4)) +
+    (if IsNaN(pend5) then 0 else Max(0, close - pend5)) +
+    (if IsNaN(pend6) then 0 else Max(0, close - pend6))
+    else 0;
+
+def openDownDisp = if pendType == 1 then
+    (if IsNaN(pend1) then 0 else Max(0, pend1 - close)) +
+    (if IsNaN(pend2) then 0 else Max(0, pend2 - close)) +
+    (if IsNaN(pend3) then 0 else Max(0, pend3 - close)) +
+    (if IsNaN(pend4) then 0 else Max(0, pend4 - close)) +
+    (if IsNaN(pend5) then 0 else Max(0, pend5 - close)) +
+    (if IsNaN(pend6) then 0 else Max(0, pend6 - close))
+    else 0;
+
+def upDisp_S   = (runUpDisp + openUpDisp)     - GetValue(runUpDisp   + openUpDisp,   LookbackShort, 500);
 def downDisp_S = (runDownDisp + openDownDisp) - GetValue(runDownDisp + openDownDisp, LookbackShort, 500);
 def pBull_S    = upDisp_S >= downDisp_S;
 
-def upDisp_M   = (runUpDisp + openUpDisp)   - GetValue(runUpDisp   + openUpDisp,   LookbackMid, 500);
+def upDisp_M   = (runUpDisp + openUpDisp)     - GetValue(runUpDisp   + openUpDisp,   LookbackMid, 500);
 def downDisp_M = (runDownDisp + openDownDisp) - GetValue(runDownDisp + openDownDisp, LookbackMid, 500);
 def pBull_M    = upDisp_M >= downDisp_M;
 
-def upDisp_L   = (runUpDisp + openUpDisp)   - GetValue(runUpDisp   + openUpDisp,   LookbackLong, 500);
+def upDisp_L   = (runUpDisp + openUpDisp)     - GetValue(runUpDisp   + openUpDisp,   LookbackLong, 500);
 def downDisp_L = (runDownDisp + openDownDisp) - GetValue(runDownDisp + openDownDisp, LookbackLong, 500);
 def pBull_L    = upDisp_L >= downDisp_L;
 
