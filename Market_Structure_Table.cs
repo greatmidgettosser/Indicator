@@ -146,60 +146,18 @@ namespace MarketStructureTable
 
                     bool isHigh = true;
                     bool isLow = true;
-                    int equalHighCount = 0;
-                    int equalLowCount = 0;
-                    int latestEqualHighOffset = -1;
-                    int latestEqualLowOffset = -1;
 
                     for (int offset = 0; offset < windowSize; offset++)
                     {
                         if (offset == center) continue;
                         double val = RBuf(offset);
 
-                        if (val > centerVal)
-                            isHigh = false;
-                        else if (val == centerVal)
-                        {
-                            equalHighCount++;
-                            if (latestEqualHighOffset < 0 || offset < latestEqualHighOffset)
-                                latestEqualHighOffset = offset;
-                        }
-
-                        if (val < centerVal)
-                            isLow = false;
-                        else if (val == centerVal)
-                        {
-                            equalLowCount++;
-                            if (latestEqualLowOffset < 0 || offset < latestEqualLowOffset)
-                                latestEqualLowOffset = offset;
-                        }
+                        if (val > centerVal) isHigh = false;
+                        if (val < centerVal) isLow = false;
                     }
 
-                    if (isHigh)
-                    {
-                        if (equalHighCount == 0)
-                            pivHigh[centerIdx] = centerVal;
-                        else if (equalHighCount == 1)
-                        {
-                            if (latestEqualHighOffset < center)
-                                pivHigh[RIdx(latestEqualHighOffset)] = centerVal;
-                            else
-                                pivHigh[centerIdx] = centerVal;
-                        }
-                    }
-
-                    if (isLow)
-                    {
-                        if (equalLowCount == 0)
-                            pivLow[centerIdx] = centerVal;
-                        else if (equalLowCount == 1)
-                        {
-                            if (latestEqualLowOffset < center)
-                                pivLow[RIdx(latestEqualLowOffset)] = centerVal;
-                            else
-                                pivLow[centerIdx] = centerVal;
-                        }
-                    }
+                    if (isHigh) pivHigh[centerIdx] = centerVal;
+                    if (isLow) pivLow[centerIdx] = centerVal;
                 }
             }
             else
@@ -239,51 +197,67 @@ namespace MarketStructureTable
         }
 
         private (bool bullish, string label, double upDisp, double downDisp)
-            PivotStructure(int lb)
+    PivotStructure(int lb)
         {
             int scan = Math.Min(lb, barCount);
 
-            double lastH = double.NaN;
-            double lastL = double.NaN;
             double upDisp = 0.0;
             double downDisp = 0.0;
-            bool lastWasLow = false;
+
+            var pending = new System.Collections.Generic.List<double>();
+            bool pendingIsHigh = false;
+            bool havePending = false;
 
             for (int offset = scan - 1; offset >= 0; offset--)
             {
                 int idx = RIdx(offset);
-
                 double ph = pivHigh[idx];
                 double pl = pivLow[idx];
 
                 if (!double.IsNaN(ph))
                 {
-                    if (!double.IsNaN(lastL))
-                        upDisp += Math.Max(0, ph - lastL);
-
-                    lastH = ph;
-                    lastWasLow = false;
+                    if (havePending && !pendingIsHigh)
+                    {
+                        foreach (double pl0 in pending)
+                            upDisp += Math.Max(0, ph - pl0);
+                        pending.Clear();
+                    }
+                    pending.Add(ph);
+                    pendingIsHigh = true;
+                    havePending = true;
                 }
 
                 if (!double.IsNaN(pl))
                 {
-                    if (!double.IsNaN(lastH))
-                        downDisp += Math.Max(0, lastH - pl);
-
-                    lastL = pl;
-                    lastWasLow = true;
+                    if (havePending && pendingIsHigh)
+                    {
+                        foreach (double ph0 in pending)
+                            downDisp += Math.Max(0, ph0 - pl);
+                        pending.Clear();
+                    }
+                    pending.Add(pl);
+                    pendingIsHigh = false;
+                    havePending = true;
                 }
             }
 
             double currentPrice = RBuf(0);
-
-            if (lastWasLow && !double.IsNaN(lastL))
-                upDisp += Math.Max(0, currentPrice - lastL);
-            else if (!lastWasLow && !double.IsNaN(lastH))
-                downDisp += Math.Max(0, lastH - currentPrice);
+            if (havePending)
+            {
+                if (pendingIsHigh)
+                {
+                    foreach (double ph0 in pending)
+                        downDisp += Math.Max(0, ph0 - currentPrice);
+                }
+                else
+                {
+                    foreach (double pl0 in pending)
+                        upDisp += Math.Max(0, currentPrice - pl0);
+                }
+            }
 
             bool bull = upDisp >= downDisp;
-            string label = $"up {upDisp:F2} down {downDisp:F2}";
+            string label = $"↑{upDisp:F2} ↓{downDisp:F2}";
             return (bull, label, upDisp, downDisp);
         }
 
@@ -342,9 +316,9 @@ namespace MarketStructureTable
         {
             var gr = args.Graphics;
 
-            int colW0 = 55;
-            int colW1 = 135;
-            int colW2 = 200;
+            int colW0 = 30;
+            int colW1 = 85;
+            int colW2 = 105;
             int rowH = 22;
             int pad = 6;
             int x = TableX;
@@ -362,8 +336,8 @@ namespace MarketStructureTable
             gr.FillRectangle(new SolidBrush(HeaderColor), x, y, totalW, rowH);
             int cx = x + pad;
             gr.DrawString("Bars", fHdr, new SolidBrush(MutedColor), cx, y + 5);
-            gr.DrawString("Per Bar Expectancy", fHdr, new SolidBrush(MutedColor), cx + colW0, y + 5);
-            gr.DrawString("Pivots High vs Pivots Low", fHdr, new SolidBrush(MutedColor), cx + colW0 + colW1, y + 5);
+            gr.DrawString("Points/Bar", fHdr, new SolidBrush(MutedColor), cx + colW0, y + 5);
+            gr.DrawString("Highs vs Lows", fHdr, new SolidBrush(MutedColor), cx + colW0 + colW1, y + 5);
 
             int[] lbs = { LookbackShort, LookbackMid, LookbackLong };
 
@@ -384,17 +358,13 @@ namespace MarketStructureTable
                 bool sBull = SpreadSlope(lb);
                 double avgPts = AvgPointsPerBar(lb);
                 double spreadVal = Math.Round(spreadBuf[RIdx(0)] - spreadBuf[RIdx(lb)], 4);
-                gr.DrawString(sBull ? "BULL" : "BEAR", fCell,
-                    new SolidBrush(sBull ? BullColor : BearColor), cx, rowY + 4);
                 gr.DrawString($"{spreadVal:(+0.);(-0.)}|{avgPts:F2}", fSml,
-                    new SolidBrush(TextColor), cx + 42, rowY + 5);
+                    new SolidBrush(sBull ? BullColor : BearColor), cx, rowY + 5);
 
                 cx += colW1;
                 var (pBull, pLabel, _, _) = PivotStructure(lb);
-                gr.DrawString(pBull ? "BULL" : "BEAR", fCell,
-                    new SolidBrush(pBull ? BullColor : BearColor), cx, rowY + 4);
                 gr.DrawString(pLabel, fSml,
-                    new SolidBrush(TextColor), cx + 42, rowY + 5);
+                    new SolidBrush(pBull ? BullColor : BearColor), cx, rowY + 5);
             }
 
             int div1 = x + pad + colW0;
