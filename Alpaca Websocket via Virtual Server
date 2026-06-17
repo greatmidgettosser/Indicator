@@ -22,7 +22,7 @@ APP_SECRET_DBX        = os.getenv("APP_SECRET_DBX")
 
 SYMBOLS  = ["SPY","QQQ","IWM","AAPL","AMZN","PLTR","TSLA","IBIT","SLV","NVDA",
             "MSFT","META","MARA","GOOGL","AMD","ARM","GLD","SMCI","MU","SNDK",
-            "DELL","INTC", "RKLB", "CRCL", "NFLX", "IREN", "MSTR", "CVNA", "NOK"]
+            "DELL","INTC", "RKLB", "CRCL", "NFLX", "IREN", "MSTR", "CVNA", "NOK", "SPCX"]
 CSV_DIR  = "/home/ubuntu/alpaca-stream/live_data"
 eastern  = pytz.timezone("America/New_York")
 wss_client = None
@@ -30,18 +30,29 @@ bar_queue  = asyncio.Queue()
 
 os.makedirs(CSV_DIR, exist_ok=True)
 
-def upload_to_dropbox(symbol, local_path, dropbox_path):
-    try:
-        dbx = dropbox.Dropbox(
+# Create ONE shared Dropbox client at startup
+_dbx_client = None
+
+def get_dbx():
+    global _dbx_client
+    if _dbx_client is None:
+        _dbx_client = dropbox.Dropbox(
             oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
             app_key=APP_KEY_DBX,
             app_secret=APP_SECRET_DBX
         )
+    return _dbx_client
+
+def upload_to_dropbox(symbol, local_path, dropbox_path):
+    global _dbx_client
+    try:
+        dbx = get_dbx()
         with open(local_path, "rb") as f:
             dbx.files_upload(f.read(), dropbox_path, mode=WriteMode.overwrite)
         print(f"Uploaded {os.path.basename(local_path)} to Dropbox")
     except Exception as e:
         print(f"Dropbox upload error for {symbol}: {e}")
+        _dbx_client = None
 
 def resample_to_5min(symbol):
     local_path = f"{CSV_DIR}/{symbol}_live.csv"
@@ -88,7 +99,6 @@ def watchdog():
                 threading.Thread(target=start_stream, daemon=True).start()
                 last_bar_time["t"] = time.time()
 
-upload_semaphore = asyncio.Semaphore(5)  # max 5 concurrent uploads
 
 async def process_bar(bar):
     try:
@@ -103,25 +113,30 @@ async def process_bar(bar):
             "volume":    bar.volume
         }
         df = pd.DataFrame([row])
-        df.to_csv(local_path, mode="a", header=not os.path.exists(local_path), index=False)
+        write_header = not os.path.exists(local_path)
+        df.to_csv(local_path, mode="a", header=write_header, index=False)
         print(f"Bar saved: {bar.symbol} {ts_eastern}")
 
         loop = asyncio.get_event_loop()
-        async with upload_semaphore:
-            try:
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, upload_to_dropbox, bar.symbol, local_path,
-                                         f"/Live Market Data/{bar.symbol}_live.csv"),
-                    timeout=15.0
-                )
-                out_path = resample_to_5min(bar.symbol)
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, upload_to_dropbox, bar.symbol, out_path,
-                                         f"/Live Market Data/{bar.symbol}_live_5min.csv"),
-                    timeout=15.0
-                )
-            except asyncio.TimeoutError:
-                print(f"Dropbox upload timed out for {bar.symbol}, skipping")
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, upload_to_dropbox, bar.symbol, local_path,
+                                     f"/Live Market Data/{bar.symbol}_live.csv"),
+                timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            print(f"1min upload timed out for {bar.symbol}, skipping")
+
+        out_path = resample_to_5min(bar.symbol)
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, upload_to_dropbox, bar.symbol, out_path,
+                                     f"/Live Market Data/{bar.symbol}_live_5min.csv"),
+                timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            print(f"5min upload timed out for {bar.symbol}, skipping")
+
     except Exception as e:
         print(f"Processor error for {bar.symbol}: {e}")
 
