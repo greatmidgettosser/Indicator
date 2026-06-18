@@ -6,11 +6,16 @@ import pandas as pd
 from bar_utils import load_bars
 
 warnings.filterwarnings("ignore")
+try:
+    from colorama import init as _colorama_init
+    _colorama_init()
+except ImportError:
+    pass
 
 DATA_DIR   = "C:/Users/Justin/Dropbox/Live Market Data"
 RANK_BY    = "5min"   # "1min" or "5min"
 
-DELTA_MODE = False    # True = show score change over N bars; False = normal mode
+DELTA_MODE = True    # True = show score change over N bars; False = normal mode
 DELTA_BARS = 6        # number of bars to look back when DELTA_MODE is True
 
 PCT_LOOKBACK = 20     # number of 1min bars to look back for % change table
@@ -22,19 +27,33 @@ CLOUD_PROXIMITY_PCT_5M = 0.1  # highlight Cloud Distance yellow when Price/SpanB
 
 # ── 1m Cloud parameters ──────────────────────────────────────────────────────
 CLOUD_SENKOU_B_1M      = 30   # SenkouB lookback period (1m bars)
-CLOUD_MIN_BARS_1M      = 30    # minimum 1m bars before cloud is calculated (warmup only)
-CLOUD_PROXIMITY_PCT_1M = 0.05  # highlight Cloud Distance yellow when Price/SpanB are within this %
+CLOUD_MIN_BARS_1M      = 30   # minimum 1m bars before cloud is calculated (warmup only)
+CLOUD_PROXIMITY_PCT_1M = 0.06 # highlight Cloud Distance yellow when Price/SpanB are within this %
 
 CLOUD_DIST_SHOW_PCT = False   # True = show "1.23(0.45%)"  False = show "1.23" only
+OSC_5M_SHOW         = False   # True = show Osc 5m column  False = hide it
 
 WEIGHTS = {
     "ema_stack" : 0.30,
     "adx"       : 0.25,
     "rsi"       : 0.20,
-    "roc"       : 0.15,
-    "macd"      : 0.10,
+    "macd"      : 0.15,
+    "roc"       : 0.10,
 }
 
+# ── Divergence scanner parameters ────────────────────────────────────────────
+DIV_ENGINE         = 0   # 0 Stochastic, 1 ROC, 2 Original (regression), 3 Hybrid
+DIV_MOM_PERIOD     = 14
+DIV_PIVOT_BARS     = 3
+DIV_TIMEFRAMES     = ["1min", "2min", "3min", "5min"]
+
+GREEN  = "\033[92m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+RESET  = "\033[0m"
+
+def colorize(text, color):
+    return f"{color}{text}{RESET}"
 def calc_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 def calc_adx(df, period=14):
@@ -66,27 +85,25 @@ def calc_rsi(series, period=14):
 def calc_roc(series, period=10):
     return ((series - series.shift(period)) / series.shift(period)) * 100
 def calc_session_vwap(df):
-    """Standard session VWAP reset at open (9:30)."""
     typical  = (df["high"] + df["low"] + df["close"]) / 3
     cum_tp_v = (typical * df["volume"]).cumsum()
     cum_v    = df["volume"].cumsum()
     return cum_tp_v / cum_v.replace(0, np.nan)
 def calc_cloud(df, senkou_b_period, min_bars):
-    """
-    Generic cloud calculator — works for any timeframe df.
-    Returns (direction, span_a, span_b) or (None, None, None) if insufficient bars.
-    """
     if len(df) < min_bars:
         return None, None, None
-
     last   = df.iloc[-1]
     span_a = (last["high"] + last["low"]) / 2.0
-
     window = df.iloc[-min(senkou_b_period, len(df)):]
     span_b = (window["high"].max() + window["low"].min()) / 2.0
-
     direction = "Bullish" if span_a > span_b else "Bearish"
     return direction, round(span_a, 2), round(span_b, 2)
+def calc_stoch_momentum(df, period=14):
+    hi  = df["high"].rolling(period).max()
+    lo  = df["low"].rolling(period).min()
+    rng = hi - lo
+    stoch = ((df["close"] - lo) / rng.replace(0, np.nan) * 100 - 50) * 1.6
+    return stoch.clip(-80, 80).iloc[-1]
 def get_direction(ema8, ema21, ema50):
     if ema8 > ema21 > ema50:
         return "Bullish"
@@ -242,7 +259,6 @@ def prep_df(df):
     df.columns = [c.strip().lower() for c in df.columns]
     return df.sort_values("timestamp").reset_index(drop=True)
 def _calc_tier(cloud_dir, ema_dir, vwap_confirms, in_pullback):
-    """Shared tier logic for both 1m and 5m cloud."""
     trend_agrees = cloud_dir == ema_dir and ema_dir in ("Bullish", "Bearish")
     if trend_agrees and vwap_confirms and in_pullback:
         return 1
@@ -260,33 +276,28 @@ def score_pullback(df_5m, df_1m):
 
     last_close = df_5m["close"].iloc[-1]
 
-    # ── EMA Stack (5m) ──
     close_5m = df_5m["close"]
     ema7  = calc_ema(close_5m, 7).iloc[-1]
     ema20 = calc_ema(close_5m, 20).iloc[-1]
     ema30 = calc_ema(close_5m, 30).iloc[-1]
     ema_dir = get_direction(ema7, ema20, ema30)
 
-    # ── 5m Cloud ──
-    cloud_dir_5m, span_a_5m, span_b_5m = calc_cloud(
-        df_5m, CLOUD_SENKOU_B_5M, CLOUD_MIN_BARS_5M)
+    cloud_dir_5m, span_a_5m, span_b_5m = calc_cloud(df_5m, CLOUD_SENKOU_B_5M, CLOUD_MIN_BARS_5M)
     if cloud_dir_5m is None:
         return None
 
-    # ── 1m Cloud ──
-    cloud_dir_1m, span_a_1m, span_b_1m = calc_cloud(
-        df_1m, CLOUD_SENKOU_B_1M, CLOUD_MIN_BARS_1M)
+    cloud_dir_1m, span_a_1m, span_b_1m = calc_cloud(df_1m, CLOUD_SENKOU_B_1M, CLOUD_MIN_BARS_1M)
     if cloud_dir_1m is None:
         return None
 
-    # ── Session VWAP distance (5m) ──
     vwap_val  = calc_session_vwap(df_5m).iloc[-1]
     vwap_dist = round(last_close - vwap_val, 2)
 
-    # ── RSI 1m ──
     rsi_1m = round(calc_rsi(df_1m["close"]).iloc[-1], 1)
 
-    # ── Trend direction & confirmations (5m cloud) ──
+    osc_1m = round(calc_stoch_momentum(df_1m), 1)
+    osc_5m = round(calc_stoch_momentum(df_5m), 1)
+
     trend_agrees_5m = cloud_dir_5m == ema_dir and ema_dir in ("Bullish", "Bearish")
     trend_dir_5m    = cloud_dir_5m if trend_agrees_5m else "Mixed"
 
@@ -300,7 +311,6 @@ def score_pullback(df_5m, df_1m):
         vwap_confirms_5m = False
         in_pullback_5m   = False
 
-    # ── Trend direction & confirmations (1m cloud) ──
     trend_agrees_1m = cloud_dir_1m == ema_dir and ema_dir in ("Bullish", "Bearish")
     trend_dir_1m    = cloud_dir_1m if trend_agrees_1m else "Mixed"
 
@@ -314,29 +324,23 @@ def score_pullback(df_5m, df_1m):
         vwap_confirms_1m = False
         in_pullback_1m   = False
 
-
-    # ── Tiers ──
     tier_5m = _calc_tier(cloud_dir_5m, ema_dir, vwap_confirms_5m, in_pullback_5m)
     tier_1m = _calc_tier(cloud_dir_1m, ema_dir, vwap_confirms_1m, in_pullback_1m)
 
-    # ── Cloud distances: price vs SpanB (points + %) ──
     cloud_dist_5m     = round(abs(last_close - span_b_5m), 2)
     cloud_dist_5m_pct = round(cloud_dist_5m / last_close * 100, 2) if last_close else 0.0
 
     cloud_dist_1m     = round(abs(last_close - span_b_1m), 2)
     cloud_dist_1m_pct = round(cloud_dist_1m / last_close * 100, 2) if last_close else 0.0
 
-    # ── Pullback proximity (secondary sort key) ──
-    # Positive = deeper in pullback zone; negative = outside but approaching
     if ema_dir == "Bullish":
-        pullback_proximity = 45 - rsi_1m   # >0 when rsi<45 (in zone), <0 when above
+        pullback_proximity = 45 - rsi_1m
     elif ema_dir == "Bearish":
-        pullback_proximity = rsi_1m - 55   # >0 when rsi>55 (in zone), <0 when below
+        pullback_proximity = rsi_1m - 55
     else:
         pullback_proximity = 0.0
 
     return {
-        # 5m cloud
         "cloud_dir_5m"      : cloud_dir_5m,
         "span_b_5m"         : span_b_5m,
         "trend_dir_5m"      : trend_dir_5m,
@@ -345,7 +349,6 @@ def score_pullback(df_5m, df_1m):
         "tier_5m"           : tier_5m,
         "cloud_dist_5m"     : cloud_dist_5m,
         "cloud_dist_5m_pct" : cloud_dist_5m_pct,
-        # 1m cloud
         "cloud_dir_1m"      : cloud_dir_1m,
         "span_b_1m"         : span_b_1m,
         "trend_dir_1m"      : trend_dir_1m,
@@ -354,20 +357,208 @@ def score_pullback(df_5m, df_1m):
         "tier_1m"           : tier_1m,
         "cloud_dist_1m"     : cloud_dist_1m,
         "cloud_dist_1m_pct" : cloud_dist_1m_pct,
-        # shared
         "ema_dir"           : ema_dir,
         "vwap_dist"         : vwap_dist,
         "rsi_1m"            : rsi_1m,
         "last_close"        : last_close,
         "pullback_proximity": round(pullback_proximity, 1),
-
+        "osc_1m"            : osc_1m,
+        "osc_5m"            : osc_5m,
     }
-GREEN  = "\033[92m"
-RED    = "\033[91m"
-YELLOW = "\033[93m"
-RESET  = "\033[0m"
-def colorize(text, color):
-    return f"{color}{text}{RESET}"
+def _load_csv_raw(path):
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
+    return df
+def _resample_ohlcv(df_1min, rule):
+    df = df_1min.set_index("timestamp")
+    out = df.resample(rule, label="left", closed="left").agg({
+        "open": "first", "high": "max", "low": "min",
+        "close": "last", "volume": "sum",
+    })
+    out = out.dropna(subset=["open", "high", "low", "close"]).reset_index()
+    return out
+def _load_div_timeframes(symbol):
+    path_1min = os.path.join(DATA_DIR, f"{symbol}_live.csv")
+    path_5min = os.path.join(DATA_DIR, f"{symbol}_live_5min.csv")
+    frames = {}
+    if os.path.exists(path_1min):
+        df1 = _load_csv_raw(path_1min)
+        frames["1min"] = df1
+        frames["2min"] = _resample_ohlcv(df1, "2min")
+        frames["3min"] = _resample_ohlcv(df1, "3min")
+    if os.path.exists(path_5min):
+        frames["5min"] = _load_csv_raw(path_5min)
+    return frames
+def _calc_stochastic_mom(high, low, close, period):
+    hi = pd.Series(high).rolling(period).max().to_numpy()
+    lo = pd.Series(low).rolling(period).min().to_numpy()
+    rng = hi - lo
+    safe_rng = np.where(rng < 1e-10, 1.0, rng)
+    k = (close - lo) / safe_rng * 100.0 - 50.0
+    k = np.where(rng < 1e-10, 0.0, k)
+    return k * 1.6
+def _calc_roc_mom(close, period):
+    prev = pd.Series(close).shift(period).to_numpy()
+    safe_prev = np.where(np.abs(prev) < 1e-10, 1.0, prev)
+    out = (close - prev) / safe_prev * 100.0 * 4.0
+    return np.where(np.abs(prev) < 1e-10, 0.0, out)
+def _calc_original_mom(high, low, close, period):
+    n = len(close)
+    out = np.full(n, np.nan)
+    mid = (high + low) / 2.0
+    diff = close - mid
+    idx = np.arange(period)
+    sum_x = idx.sum()
+    sum_x2 = (idx ** 2).sum()
+    denom = period * sum_x2 - sum_x * sum_x
+    for end in range(period - 1, n):
+        window = diff[end - period + 1: end + 1][::-1]
+        sum_y  = window.sum()
+        sum_xy = (idx * window).sum()
+        if abs(denom) < 1e-10:
+            out[end] = 0.0
+        else:
+            slope = (period * sum_xy - sum_x * sum_y) / denom
+            out[end] = np.clip(slope * 100.0, -80, 80)
+    return out
+def _calc_div_momentum(df, engine, period):
+    high  = df["high"].to_numpy()
+    low   = df["low"].to_numpy()
+    close = df["close"].to_numpy()
+    if engine == 1:
+        return _calc_roc_mom(close, period)
+    if engine == 2:
+        return _calc_original_mom(high, low, close, period)
+    if engine == 3:
+        return (_calc_stochastic_mom(high, low, close, period)
+                + _calc_roc_mom(close, period)
+                + _calc_original_mom(high, low, close, period)) / 3.0
+    return _calc_stochastic_mom(high, low, close, period)
+def _find_transition_dots(times, closes, mom_norm, lb):
+    n = len(closes)
+    last_price_high, last_osc_high, last_bar_high = np.nan, np.nan, -1
+    last_price_low,  last_osc_low,  last_bar_low  = np.nan, np.nan, -1
+    last_bear_kind, last_bull_kind = None, None
+    transitions = []
+
+    for bar in range(2 * lb, n):
+        pivot = bar - lb
+        if pivot < lb:
+            continue
+
+        piv_close = closes[pivot]
+        is_swing_high = is_swing_low = True
+        for i in range(1, lb + 1):
+            older, newer = closes[pivot - i], closes[pivot + i]
+            if piv_close <= older or piv_close <= newer:
+                is_swing_high = False
+            if piv_close >= older or piv_close >= newer:
+                is_swing_low = False
+
+        osc_at_pivot = mom_norm[pivot]
+        cur_price    = closes[pivot]
+        if np.isnan(osc_at_pivot):
+            continue
+
+        if is_swing_high:
+            if not np.isnan(last_price_high) and last_bar_high >= 0:
+                kind = None
+                if cur_price > last_price_high and osc_at_pivot < last_osc_high:
+                    kind = "Regular"
+                elif cur_price < last_price_high and osc_at_pivot > last_osc_high:
+                    kind = "Hidden"
+                if kind is not None:
+                    if last_bear_kind is not None and kind != last_bear_kind:
+                        transitions.append({
+                            "time"     : times[bar],
+                            "price"    : closes[bar],
+                            "direction": "bearish",
+                        })
+                    last_bear_kind = kind
+            last_price_high, last_osc_high, last_bar_high = cur_price, osc_at_pivot, pivot
+
+        if is_swing_low:
+            if not np.isnan(last_price_low) and last_bar_low >= 0:
+                kind = None
+                if cur_price < last_price_low and osc_at_pivot > last_osc_low:
+                    kind = "Regular"
+                elif cur_price > last_price_low and osc_at_pivot < last_osc_low:
+                    kind = "Hidden"
+                if kind is not None:
+                    if last_bull_kind is not None and kind != last_bull_kind:
+                        transitions.append({
+                            "time"     : times[bar],
+                            "price"    : closes[bar],
+                            "direction": "bullish",
+                        })
+                    last_bull_kind = kind
+            last_price_low, last_osc_low, last_bar_low = cur_price, osc_at_pivot, pivot
+
+    return transitions
+def scan_divergence(symbol):
+    """Return (result_dict, last_bar_time) for a symbol, or (None, last_bar_time)."""
+    frames = _load_div_timeframes(symbol)
+    if "1min" not in frames:
+        return None, None
+
+    last_bar_time = frames["1min"]["timestamp"].iloc[-1]
+    results = []
+
+    for tf in DIV_TIMEFRAMES:
+        df = frames.get(tf)
+        if df is None or len(df) < (2 * DIV_PIVOT_BARS + DIV_MOM_PERIOD + 1):
+            continue
+        mom      = _calc_div_momentum(df, DIV_ENGINE, DIV_MOM_PERIOD)
+        mom_norm = np.clip(mom, -80, 80)
+        times    = df["timestamp"].to_numpy()
+        closes   = df["close"].to_numpy()
+        dots     = _find_transition_dots(times, closes, mom_norm, DIV_PIVOT_BARS)
+        if dots:
+            most_recent = max(dots, key=lambda d: d["time"])
+            results.append((tf, most_recent))
+
+    if not results:
+        return None, last_bar_time
+
+    best_tf, best_dot = max(results, key=lambda r: r[1]["time"])
+    return {
+        "symbol"   : symbol,
+        "timeframe": best_tf,
+        "direction": best_dot["direction"],
+        "time"     : pd.Timestamp(best_dot["time"]),
+        "price"    : best_dot["price"],
+    }, last_bar_time
+def fmt_ago(delta):
+    secs = max(0, int(delta.total_seconds()))
+    if secs < 60:
+        return f"{secs}s ago"
+    mins, secs = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}m ago"
+    hrs, mins = divmod(mins, 60)
+    return f"{hrs}h {mins}m ago"
+def print_divergence_table(rows, now_ts):
+    if not rows:
+        print("  No divergence transitions found for any symbol.")
+        return
+
+    rows = sorted(rows, key=lambda r: r["time"], reverse=True)
+
+    header = f"{'#':<3}{'SYMBOL':<8}{'DIRECTION':<10}{'TF':<5}{'TIME':<6}{'AGO':<12}{'PRICE':>10}"
+    sep    = "─" * len(header)
+    print("  " + sep)
+    print("  " + header)
+    print("  " + sep)
+    for n, r in enumerate(rows, 1):
+        color    = GREEN if r["direction"] == "bullish" else RED
+        ago      = fmt_ago(now_ts - r["time"])
+        time_str = r["time"].strftime("%H:%M")
+        line = (f"{color}{n:<3}{r['symbol']:<8}{r['direction'].upper():<10}"
+                f"{r['timeframe']:<5}{time_str:<6}{ago:<12}{r['price']:>10.2f}{RESET}")
+        print("  " + line)
+    print("  " + sep)
 def run_screener():
     pattern_1m = os.path.join(DATA_DIR, "*_live.csv")
     files_1m   = [f for f in glob.glob(pattern_1m) if "_5min" not in f]
@@ -379,6 +570,8 @@ def run_screener():
     results          = []
     pullback_results = []
     pct_results      = []
+    div_rows         = []
+    div_last_bars    = []
 
     for path_1m in sorted(files_1m):
         symbol  = os.path.basename(path_1m).replace("_live.csv", "").upper()
@@ -433,12 +626,75 @@ def run_screener():
         if pct is not None:
             pct_results.append({"symbol": symbol, "pct": pct})
 
+        # ── Divergence scan ──
+        try:
+            div_result, div_last_bar = scan_divergence(symbol)
+            if div_last_bar is not None:
+                div_last_bars.append(div_last_bar)
+            if div_result is not None:
+                div_rows.append(div_result)
+        except Exception as e:
+            pass  # silently skip divergence errors per symbol
+
     if not results:
         print("\n  No symbols could be scored.\n")
         return
 
     # ════════════════════════════════════════════════════════════════════════
-    # SECTION 1 — Original Trend / Momentum Screener
+    # SECTION 1 — % Change Table
+    # ════════════════════════════════════════════════════════════════════════
+
+    if pct_results:
+        pct_results = sorted(pct_results, key=lambda x: abs(x["pct"]), reverse=True)
+
+        W2   = dict(rank=4, symbol=8, pct=12)
+        hdr2 = (
+            f"{'#':<{W2['rank']}}"
+            f"{'Symbol':<{W2['symbol']}}"
+            f"{'% Change':>{W2['pct']}}"
+        )
+        sep2 = "─" * len(hdr2)
+
+        print()
+        print(f"  % CHANGE  |  Lookback: {PCT_LOOKBACK} bars (1min)")
+        print(f"  Symbols: {len(pct_results)}")
+        print()
+        print("  " + sep2)
+        print("  " + hdr2)
+        print("  " + sep2)
+
+        for i, row in enumerate(pct_results, 1):
+            pct_val = row["pct"]
+            pct_str = f"{pct_val:+.2f}%"
+            if pct_val > 0:
+                colored = colorize(f"{pct_str:>{W2['pct']}}", GREEN)
+            else:
+                colored = colorize(f"{pct_str:>{W2['pct']}}", RED)
+
+            print(
+                f"  {f'{i}.':<{W2['rank']}}"
+                f"{row['symbol']:<{W2['symbol']}}"
+                + colored
+            )
+
+        print("  " + sep2)
+        print()
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Divergence Transition Table
+    # ════════════════════════════════════════════════════════════════════════
+
+    now_ts = max(div_last_bars) if div_last_bars else pd.Timestamp.now()
+
+    print()
+    print(f"  DIVERGENCE TRANSITIONS  |  Engine: {['Stochastic','ROC','Original','Hybrid'][DIV_ENGINE]}  |  Period: {DIV_MOM_PERIOD}  |  Pivot bars: {DIV_PIVOT_BARS}")
+    print(f"  Symbols with signal: {len(div_rows)}")
+    print()
+    print_divergence_table(div_rows, now_ts)
+    print()
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 3 — Original Trend / Momentum Screener
     # ════════════════════════════════════════════════════════════════════════
 
     sort_col = "score_5m" if RANK_BY == "5min" else "score_1m"
@@ -525,39 +781,41 @@ def run_screener():
     print()
 
     # ════════════════════════════════════════════════════════════════════════
-    # SECTION 2 — Pullback / Alignment Screener
+    # SECTION 4 — Pullback / Alignment Screener
     # ════════════════════════════════════════════════════════════════════════
 
     if pullback_results:
-        # Sort by the tier that matches RANK_BY
         tier_key = "tier_5m" if RANK_BY == "5min" else "tier_1m"
         pullback_results = sorted(
             pullback_results,
             key=lambda x: (x[tier_key], -x["pullback_proximity"])
         )
-        # Column widths — cloud dist cells are wider to fit "12.34 (0.56%)"
         WP = dict(
             rank   = 4,
             symbol = 8,
-            cloud1 = 12,   # Cloud 1m
-            cloud5 = 12,   # Cloud 5m
-            ema    = 12,   # EMA Stack
-            vwap   = 12,   # VWAP Dist
-            rsi    = 10,   # RSI 1m
-            cdist1=18 if CLOUD_DIST_SHOW_PCT else 12,  # Cloud Dist 1m
-            cdist5=18 if CLOUD_DIST_SHOW_PCT else 12,  # Cloud Dist 5m
+            cloud1 = 12,
+            cloud5 = 12,
+            ema    = 12,
+            vwap   = 12,
+            rsi    = 10,
+            cdist1 = 18 if CLOUD_DIST_SHOW_PCT else 12,
+            cdist5 = 18 if CLOUD_DIST_SHOW_PCT else 12,
+            osc1   = 10,
+            osc5   = 10 if OSC_5M_SHOW else 0,
         )
 
         hdr_pb = (
-            f"{'#':<{WP['rank']}}"
-            f"{'Symbol':<{WP['symbol']}}"
-            f"{'Cloud 1m':<{WP['cloud1']}}"
-            f"{'Cloud 5m':<{WP['cloud5']}}"
-            f"{'EMA Stack':<{WP['ema']}}"
-            f"{'VWAP Dist':>{WP['vwap']}}"
-            f"{'RSI 1m':>{WP['rsi']}}"
-            f"{'Dist 1m':>{WP['cdist1']}}"
-            f"{'Dist 5m':>{WP['cdist5']}}"
+                f"{'#':<{WP['rank']}}"
+                f"{'Symbol':<{WP['symbol']}}"
+                f"{'Cloud 1m':<{WP['cloud1']}}"
+                f"{'Cloud 5m':<{WP['cloud5']}}"
+                f"{'EMA Stack':<{WP['ema']}}"
+                f"{'VWAP Dist':>{WP['vwap']}}"
+                f"{'RSI 1m':>{WP['rsi']}}"
+                f"{'Osc 1m':>{WP['osc1']}}"
+                + (f"{'Osc 5m':>{WP['osc5']}}" if OSC_5M_SHOW else "")
+                + f"{'Dist 1m':>{WP['cdist1']}}"
+                + f"{'Dist 5m':>{WP['cdist5']}}"
         )
         sep_pb = "─" * len(hdr_pb)
 
@@ -591,11 +849,9 @@ def run_screener():
                     return colorize(padded, YELLOW)
                 return padded
 
-            # Cloud direction columns
             cloud1_str = fmt_cloud(row["cloud_dir_1m"], WP["cloud1"])
             cloud5_str = fmt_cloud(row["cloud_dir_5m"], WP["cloud5"])
 
-            # EMA stack
             if row["ema_dir"] == "Bullish":
                 ema_str = colorize(f"{'Bullish':<{WP['ema']}}", GREEN)
             elif row["ema_dir"] == "Bearish":
@@ -603,14 +859,11 @@ def run_screener():
             else:
                 ema_str = f"{'Neutral':<{WP['ema']}}"
 
-            # VWAP distance
-            vd = row["vwap_dist"]
+            vd        = row["vwap_dist"]
             vd_str    = f"{vd:+.2f}"
             vd_padded = f"{vd_str:>{WP['vwap']}}"
             vwap_str  = colorize(vd_padded, GREEN if vd > 0 else RED)
 
-            # RSI — color based on whichever cloud matches RANK_BY (or just use a
-            # combined in_pullback check showing the relevant timeframe signal)
             rsi_val = row["rsi_1m"]
             rsi_raw = f"{rsi_val:>{WP['rsi']}}"
             pb_key  = "in_pullback_5m" if RANK_BY == "5min" else "in_pullback_1m"
@@ -622,7 +875,17 @@ def run_screener():
             else:
                 rsi_str = colorize(rsi_raw, YELLOW)
 
-            # Cloud distance columns
+            def fmt_osc(val, cloud_dir_5m, width):
+                raw = f"{val:>{width}}"
+                if cloud_dir_5m == "Bullish" and val < -40:
+                    return colorize(raw, GREEN)
+                elif cloud_dir_5m == "Bearish" and val > 40:
+                    return colorize(raw, RED)
+                return colorize(raw, YELLOW)
+
+            osc1_str = fmt_osc(row["osc_1m"], row["cloud_dir_5m"], WP["osc1"])
+            osc5_str = fmt_osc(row["osc_5m"], row["cloud_dir_5m"], WP["osc5"])
+
             cdist1_str = fmt_cloud_dist(
                 row["cloud_dist_1m"], row["cloud_dist_1m_pct"],
                 CLOUD_PROXIMITY_PCT_1M, WP["cdist1"]
@@ -640,6 +903,8 @@ def run_screener():
                 + ema_str
                 + vwap_str
                 + rsi_str
+                + osc1_str
+                + (osc5_str if OSC_5M_SHOW else "")
                 + cdist1_str
                 + cdist5_str
             )
@@ -652,50 +917,16 @@ def run_screener():
             f"  {RED}Red = Bearish pullback zone (>55){RESET}"
             f"  {YELLOW}Yellow = Not in pullback zone{RESET}"
         )
+        osc_label = "Osc 1m & 5m" if OSC_5M_SHOW else "Osc 1m"
+        print(
+            f"  {osc_label}: {GREEN}Green = Bullish + oversold (<-40){RESET}"
+            f"  {RED}Red = Bearish + overbought (>+40){RESET}"
+            f"  {YELLOW}Yellow = Not in pullback zone{RESET}"
+        )
         print(
             f"  Cloud Dist: {YELLOW}Yellow = Price within proximity % of Cloud"
             f"  (1m: {CLOUD_PROXIMITY_PCT_1M}%  |  5m: {CLOUD_PROXIMITY_PCT_5M}%){RESET}"
         )
-        print()
-
-    # ════════════════════════════════════════════════════════════════════════
-    # SECTION 3 — % Change Table
-    # ════════════════════════════════════════════════════════════════════════
-
-    if pct_results:
-        pct_results = sorted(pct_results, key=lambda x: abs(x["pct"]), reverse=True)
-
-        W2   = dict(rank=4, symbol=8, pct=12)
-        hdr2 = (
-            f"{'#':<{W2['rank']}}"
-            f"{'Symbol':<{W2['symbol']}}"
-            f"{'% Change':>{W2['pct']}}"
-        )
-        sep2 = "─" * len(hdr2)
-
-        print()
-        print(f"  % CHANGE  |  Lookback: {PCT_LOOKBACK} bars (1min)")
-        print(f"  Symbols: {len(pct_results)}")
-        print()
-        print("  " + sep2)
-        print("  " + hdr2)
-        print("  " + sep2)
-
-        for i, row in enumerate(pct_results, 1):
-            pct_val = row["pct"]
-            pct_str = f"{pct_val:+.2f}%"
-            if pct_val > 0:
-                colored = colorize(f"{pct_str:>{W2['pct']}}", GREEN)
-            else:
-                colored = colorize(f"{pct_str:>{W2['pct']}}", RED)
-
-            print(
-                f"  {f'{i}.':<{W2['rank']}}"
-                f"{row['symbol']:<{W2['symbol']}}"
-                + colored
-            )
-
-        print("  " + sep2)
         print()
 if __name__ == "__main__":
     run_screener()
