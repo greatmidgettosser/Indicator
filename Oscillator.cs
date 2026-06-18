@@ -293,7 +293,10 @@ namespace MicahsOscillator
 
             // ── 5. DIVERGENCES — only on bar close ────────────────
             if (isClosingBar && ShowDivergences && bar >= DivPivotBars * 2)
-                CheckDivergences(bar, momNorm);
+            {
+                double closedMomNorm = Clamp(GetValue(1, 0), -80, 80);
+                CheckDivergences(bar - 1, closedMomNorm);
+            }
         }
 
         // ═══════════════════════════════════════════════════════
@@ -552,12 +555,12 @@ namespace MicahsOscillator
 
         private void PlotDivTransition(double val, Color color)
         {
-            SetValue(val, 10, 0);
-            LinesSeries[10].SetMarker(0, new IndicatorLineMarker(color));
+            SetValue(val, 10, 1);
+            LinesSeries[10].SetMarker(1, new IndicatorLineMarker(color));
         }
 
         // ── UTILITY ─────────────────────────────────────────────
         private static double Clamp(double val, double min, double max)
             => val < min ? min : val > max ? max : val;
     }
-}
+}   
