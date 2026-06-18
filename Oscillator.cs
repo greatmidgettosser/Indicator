@@ -498,64 +498,62 @@ namespace MicahsOscillator
             if (isSwingHigh && !double.IsNaN(_lastPricePivotHigh) && _lastPivotHighBar >= 0)
             {
                 if (curPrice > _lastPricePivotHigh && oscAtPivot < _lastOscPivotHigh)
-                    ProcessDivergence(true, DivKind.Regular, _lastPivotHighBar, _lastOscPivotHigh);
+                    ProcessDivergence(true, DivKind.Regular, oscVal);
                 else if (curPrice < _lastPricePivotHigh && oscAtPivot > _lastOscPivotHigh)
-                    ProcessDivergence(true, DivKind.Hidden, _lastPivotHighBar, _lastOscPivotHigh);
+                    ProcessDivergence(true, DivKind.Hidden, oscVal);
 
                 _lastPricePivotHigh = curPrice;
                 _lastOscPivotHigh = oscAtPivot;
-                _lastPivotHighBar = pivot;
+                _lastPivotHighBar = bar;
             }
             else if (isSwingHigh)
             {
                 _lastPricePivotHigh = curPrice;
                 _lastOscPivotHigh = oscAtPivot;
-                _lastPivotHighBar = pivot;
+                _lastPivotHighBar = bar;
             }
 
             if (isSwingLow && !double.IsNaN(_lastPricePivotLow) && _lastPivotLowBar >= 0)
             {
                 if (curPrice < _lastPricePivotLow && oscAtPivot > _lastOscPivotLow)
-                    ProcessDivergence(false, DivKind.Regular, _lastPivotLowBar, _lastOscPivotLow);
+                    ProcessDivergence(false, DivKind.Regular, oscVal);
                 else if (curPrice > _lastPricePivotLow && oscAtPivot < _lastOscPivotLow)
-                    ProcessDivergence(false, DivKind.Hidden, _lastPivotLowBar, _lastOscPivotLow);
+                    ProcessDivergence(false, DivKind.Hidden, oscVal);
 
                 _lastPricePivotLow = curPrice;
                 _lastOscPivotLow = oscAtPivot;
-                _lastPivotLowBar = pivot;
+                _lastPivotLowBar = bar;
             }
             else if (isSwingLow)
             {
                 _lastPricePivotLow = curPrice;
                 _lastOscPivotLow = oscAtPivot;
-                _lastPivotLowBar = pivot;
+                _lastPivotLowBar = bar;
             }
         }
 
         // Tracks the running kind (Regular/Hidden) for each direction (bearish/bullish)
         // and plots a transition dot only when the kind flips from the previous one.
-        private void ProcessDivergence(bool isBearish, DivKind kind, int jointBar, double jointVal)
+        private void ProcessDivergence(bool isBearish, DivKind kind, double currentOscVal)
         {
             if (isBearish)
             {
                 if (_lastBearKind != DivKind.None && kind != _lastBearKind)
-                    PlotDivTransition(jointBar, jointVal, Color.Red);
+                    PlotDivTransition(currentOscVal, Color.Red);
                 _lastBearKind = kind;
             }
             else
             {
                 if (_lastBullKind != DivKind.None && kind != _lastBullKind)
-                    PlotDivTransition(jointBar, jointVal, Color.Lime);
+                    PlotDivTransition(currentOscVal, Color.Lime);
                 _lastBullKind = kind;
             }
         }
 
-        private void PlotDivTransition(int absBar, double val, Color color)
+        private void PlotDivTransition(double val, Color color)
         {
-            int offset = (Count - 1) - absBar;
-            if (offset < 0) return;
-            SetValue(val, 10, offset);
-            LinesSeries[10].SetMarker(offset, new IndicatorLineMarker(color));
+            SetValue(val, 10, 0);
+            LinesSeries[10].SetMarker(0, new IndicatorLineMarker(color));
         }
 
         // ── UTILITY ─────────────────────────────────────────────
