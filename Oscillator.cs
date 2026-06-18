@@ -98,6 +98,7 @@ namespace MicahsOscillator
         // 7 — Band Top Low edge
         // 8 — Band Bot High edge
         // 9 — Band Bot Low edge
+        // 10 — Divergence transition dot (red = bearish flip, green = bullish flip)
 
         // ── INTERNAL STATE ────────────────────────────────────────
         private int _barsSinceSignal = 999;
@@ -113,15 +114,10 @@ namespace MicahsOscillator
         private int _lastPivotHighBar = -1;
         private int _lastPivotLowBar = -1;
 
-        // Divergence line storage for OnPaintChart
-        private struct DivLine
-        {
-            public int Bar1, Bar2;
-            public double Val1, Val2;
-            public Color Color;
-            public bool Dashed;
-        }
-        private readonly List<DivLine> _divLines = new List<DivLine>();
+        // Divergence transition tracking (used to know when to plot a dot)
+        private enum DivKind { None, Regular, Hidden }
+        private DivKind _lastBearKind = DivKind.None;
+        private DivKind _lastBullKind = DivKind.None;
 
         // ── CONSTRUCTOR ───────────────────────────────────────────
         public MicahsOscillator()
@@ -148,6 +144,8 @@ namespace MicahsOscillator
             AddLineSeries("Band Top Low", Color.FromArgb(0, 0, 0, 0), lineWidth: 1, LineStyle.Solid);
             AddLineSeries("Band Bot High", Color.FromArgb(0, 0, 0, 0), lineWidth: 1, LineStyle.Solid);
             AddLineSeries("Band Bot Low", Color.FromArgb(0, 0, 0, 0), lineWidth: 1, LineStyle.Solid);
+            // 10 — Divergence transition dot (color set per-marker at plot time)
+            AddLineSeries("Div Transition", Color.FromArgb(255, 255, 255, 255), lineWidth: 6, LineStyle.Points);
         }
 
         // ── INIT ─────────────────────────────────────────────────
@@ -157,18 +155,14 @@ namespace MicahsOscillator
             _bandBottom = -75.0;
             _emaVal = double.NaN;
             _barsSinceSignal = 999;
-            _divLines.Clear();
             _lastPricePivotHigh = double.NaN;
             _lastOscPivotHigh = double.NaN;
             _lastPricePivotLow = double.NaN;
             _lastOscPivotLow = double.NaN;
             _lastPivotHighBar = -1;
             _lastPivotLowBar = -1;
-        }
-
-        protected override void OnClear()
-        {
-            _divLines.Clear();
+            _lastBearKind = DivKind.None;
+            _lastBullKind = DivKind.None;
         }
 
         // ── MAIN CALCULATION ─────────────────────────────────────
@@ -199,8 +193,8 @@ namespace MicahsOscillator
 
             // Ribbon color between momentum and signal (updates every tick)
             Color ribbonColor = momNorm >= sigNorm
-                ? Color.FromArgb(80, 230, 180, 0)
-                : Color.FromArgb(80, 220, 100, 0);
+                ? Color.FromArgb(80, 50, 205, 50)
+                : Color.FromArgb(80, 220, 30, 30);
             LinesSeries[0].SetMarker(0, new IndicatorLineMarker(ribbonColor));
 
             // Crossover arrows — only on confirmed bar close to avoid tick noise
@@ -477,6 +471,10 @@ namespace MicahsOscillator
         }
 
         // ── Divergences ──────────────────────────────────────────
+        // Pivot/divergence detection is unchanged from the original implementation.
+        // Instead of drawing a diagonal line for every regular/hidden divergence,
+        // we only plot a dot when the divergence *kind* flips (regular <-> hidden)
+        // for a given direction (bearish or bullish). See ProcessDivergence below.
         private void CheckDivergences(int bar, double oscVal)
         {
             int lb = DivPivotBars;
@@ -500,9 +498,9 @@ namespace MicahsOscillator
             if (isSwingHigh && !double.IsNaN(_lastPricePivotHigh) && _lastPivotHighBar >= 0)
             {
                 if (curPrice > _lastPricePivotHigh && oscAtPivot < _lastOscPivotHigh)
-                    StoreDivLine(_lastPivotHighBar, pivot, _lastOscPivotHigh, oscAtPivot, Color.Red, false);
+                    ProcessDivergence(true, DivKind.Regular, _lastPivotHighBar, _lastOscPivotHigh);
                 else if (curPrice < _lastPricePivotHigh && oscAtPivot > _lastOscPivotHigh)
-                    StoreDivLine(_lastPivotHighBar, pivot, _lastOscPivotHigh, oscAtPivot, Color.Orange, true);
+                    ProcessDivergence(true, DivKind.Hidden, _lastPivotHighBar, _lastOscPivotHigh);
 
                 _lastPricePivotHigh = curPrice;
                 _lastOscPivotHigh = oscAtPivot;
@@ -518,9 +516,9 @@ namespace MicahsOscillator
             if (isSwingLow && !double.IsNaN(_lastPricePivotLow) && _lastPivotLowBar >= 0)
             {
                 if (curPrice < _lastPricePivotLow && oscAtPivot > _lastOscPivotLow)
-                    StoreDivLine(_lastPivotLowBar, pivot, _lastOscPivotLow, oscAtPivot, Color.Lime, false);
+                    ProcessDivergence(false, DivKind.Regular, _lastPivotLowBar, _lastOscPivotLow);
                 else if (curPrice > _lastPricePivotLow && oscAtPivot < _lastOscPivotLow)
-                    StoreDivLine(_lastPivotLowBar, pivot, _lastOscPivotLow, oscAtPivot, Color.Cyan, true);
+                    ProcessDivergence(false, DivKind.Hidden, _lastPivotLowBar, _lastOscPivotLow);
 
                 _lastPricePivotLow = curPrice;
                 _lastOscPivotLow = oscAtPivot;
@@ -534,57 +532,34 @@ namespace MicahsOscillator
             }
         }
 
-        private void StoreDivLine(int bar1, int bar2,
-                                  double val1, double val2,
-                                  Color color, bool dashed)
+        // Tracks the running kind (Regular/Hidden) for each direction (bearish/bullish)
+        // and plots a transition dot only when the kind flips from the previous one.
+        private void ProcessDivergence(bool isBearish, DivKind kind, int jointBar, double jointVal)
         {
-            _divLines.Add(new DivLine
+            if (isBearish)
             {
-                Bar1 = bar1,
-                Bar2 = bar2,
-                Val1 = val1,
-                Val2 = val2,
-                Color = color,
-                Dashed = dashed
-            });
+                if (_lastBearKind != DivKind.None && kind != _lastBearKind)
+                    PlotDivTransition(jointBar, jointVal, Color.Red);
+                _lastBearKind = kind;
+            }
+            else
+            {
+                if (_lastBullKind != DivKind.None && kind != _lastBullKind)
+                    PlotDivTransition(jointBar, jointVal, Color.Lime);
+                _lastBullKind = kind;
+            }
+        }
+
+        private void PlotDivTransition(int absBar, double val, Color color)
+        {
+            int offset = (Count - 1) - absBar;
+            if (offset < 0) return;
+            SetValue(val, 10, offset);
+            LinesSeries[10].SetMarker(offset, new IndicatorLineMarker(color));
         }
 
         // ── UTILITY ─────────────────────────────────────────────
         private static double Clamp(double val, double min, double max)
             => val < min ? min : val > max ? max : val;
-
-        // ── PAINT ────────────────────────────────────────────────
-        public override void OnPaintChart(PaintChartEventArgs args)
-        {
-            base.OnPaintChart(args);
-
-            if (!ShowDivergences || _divLines.Count == 0) return;
-            if (CurrentChart == null) return;
-
-            var window = CurrentChart.Windows[args.WindowIndex];
-            var conv = window.CoordinatesConverter;
-            var g = args.Graphics;
-
-            foreach (var dl in _divLines)
-            {
-                int offset1 = (Count - 1) - dl.Bar1;
-                int offset2 = (Count - 1) - dl.Bar2;
-                if (offset1 < 0 || offset2 < 0) continue;
-
-                DateTime t1 = Time(offset1);
-                DateTime t2 = Time(offset2);
-
-                int x1 = (int)conv.GetChartX(t1);
-                int x2 = (int)conv.GetChartX(t2);
-                int y1 = (int)conv.GetChartY(dl.Val1);
-                int y2 = (int)conv.GetChartY(dl.Val2);
-
-                using var pen = new Pen(dl.Color, 2)
-                {
-                    DashStyle = dl.Dashed ? DashStyle.Dash : DashStyle.Solid
-                };
-                g.DrawLine(pen, x1, y1, x2, y2);
-            }
-        }
     }
 }
