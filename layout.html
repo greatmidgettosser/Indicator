@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="../../../themes/default/css/colors.css" />
+    <link rel="stylesheet" href="../../../themes/default/css/core.css" />
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background: #1e1e1e;
+            color: #ffffff;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .note-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 12px;
+            overflow: hidden;
+        }
+
+        .note-header {
+            font-size: 14px;
+            font-weight: bold;
+            color: #aaa;
+            margin-bottom: 8px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #333;
+        }
+
+            .note-header span {
+                color: #00c864;
+            }
+
+        #noteArea {
+            flex: 1;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 4px;
+            color: #ffffff;
+            font-family: Arial, sans-serif;
+            font-size: 13px;
+            padding: 10px;
+            resize: none;
+            outline: none;
+            line-height: 1.6;
+        }
+
+            #noteArea:focus {
+                border-color: #555;
+            }
+
+        .save-indicator {
+            font-size: 10px;
+            color: #555;
+            text-align: right;
+            margin-top: 4px;
+            height: 14px;
+        }
+
+            .save-indicator.saved {
+                color: #00c864;
+            }
+    </style>
+</head>
+<body>
+    <div class="note-panel">
+        <div class="note-header">
+            <span id="selectedDateLabel">Select a day to begin</span>
+        </div>
+        <textarea id="noteArea" placeholder="Write your trade notes here..."></textarea>
+        <div class="save-indicator" id="saveIndicator"></div>
+    </div>
+</body>
+</html>
