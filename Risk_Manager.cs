@@ -68,7 +68,51 @@ namespace RiskManager
             Core.Instance.TradeAdded += OnTradeAdded;
             Core.Instance.PositionAdded += OnPositionAdded;
             Core.Instance.PositionRemoved += OnPositionRemoved;
+            Core.Instance.Connections.ConnectionStateChanged += OnConnectionStateChanged;
             ScheduleResetTimer();
+        }
+
+        private void OnConnectionStateChanged(object sender, ConnectionStateChangedEventArgs e)
+        {
+            if (e.NewState != ConnectionState.Connected) return;
+            if (!_triggered) return;
+            if (_account == null) return;
+
+            // Connection is now live — safe to backfill and evaluate whether to unlock.
+            // Only unlock if reset time has already passed today AND P&L is within limits.
+            if (DateTime.Now.TimeOfDay < _sessionResetTime) return;
+
+            BackfillTodayPnL();
+            RefreshUnrealizedPnL();
+
+            double total = TotalPnL;
+            if (total > _dailyLossLimit && total < _dailyProfitTarget)
+            {
+                Core.Instance.Loggers.Log($"[RiskManager] Connection established: reset time passed, P&L ({total:C}) within limits — unlocking.");
+                _relockTimer?.Dispose();
+                _relockTimer = null;
+                _triggered = false;
+                _dailyPnL = 0.0;
+                _unrealizedPnL = 0.0;
+                _countedTradeIds.Clear();
+                try
+                {
+                    if (_account.IsLocked())
+                    {
+                        Core.Instance.UnLockAccount(_account);
+                        Core.Instance.Loggers.Log($"[RiskManager] Account {_account.Name} unlocked.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Core.Instance.Loggers.Log($"[RiskManager] Unlock error: {ex.Message}");
+                }
+                _renderer?.RedrawBufferedGraphic();
+            }
+            else
+            {
+                Core.Instance.Loggers.Log($"[RiskManager] Connection established: P&L ({total:C}) still exceeds threshold — remaining locked.");
+            }
         }
 
         private void OnPositionAdded(Position pos)
@@ -92,8 +136,8 @@ namespace RiskManager
             if (_account == null)
                 _account = Core.Instance.Accounts.FirstOrDefault();
 
-            // If the account is already locked on startup, restore _triggered so the
-            // status displays LOCKED instead of ACTIVE. Nothing else changes.
+            // Restore _triggered from lock state immediately so status shows LOCKED correctly.
+            // Unlock logic runs only after the connection is confirmed live (OnConnectionStateChanged).
             if (_account != null && _account.IsLocked())
                 _triggered = true;
 
@@ -280,6 +324,7 @@ namespace RiskManager
             Core.Instance.TradeAdded -= OnTradeAdded;
             Core.Instance.PositionAdded -= OnPositionAdded;
             Core.Instance.PositionRemoved -= OnPositionRemoved;
+            Core.Instance.Connections.ConnectionStateChanged -= OnConnectionStateChanged;
 
             // Unsubscribe Position.Updated from any still-open positions
             foreach (var pos in Core.Instance.Positions)
