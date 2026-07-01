@@ -902,8 +902,8 @@ namespace TradeJournal
                 sm.HasData && sm.AvgPnl >= 0 ? greenBrush : redBrush);
             DrawMetricRow("Avg Win", lm.WinCount > 0 ? FormatPnl(lm.AvgWin) : "—", sm.WinCount > 0 ? FormatPnl(sm.AvgWin) : "—", greenBrush, greenBrush);
             DrawMetricRow("Avg Loss", lm.LossCount > 0 ? FormatPnl(lm.AvgLoss) : "—", sm.LossCount > 0 ? FormatPnl(sm.AvgLoss) : "—", redBrush, redBrush);
-            DrawMetricRow("Best", lm.HasData ? FormatPnl(lm.LargestWin) : "—", sm.HasData ? FormatPnl(sm.LargestWin) : "—", greenBrush, greenBrush);
-            DrawMetricRow("Worst", lm.HasData ? FormatPnl(lm.LargestLoss) : "—", sm.HasData ? FormatPnl(sm.LargestLoss) : "—", redBrush, redBrush);
+            DrawMetricRow("Best Trade", lm.HasData ? FormatPnl(lm.LargestWin) : "—", sm.HasData ? FormatPnl(sm.LargestWin) : "—", greenBrush, greenBrush);
+            DrawMetricRow("Worst Trade", lm.HasData ? FormatPnl(lm.LargestLoss) : "—", sm.HasData ? FormatPnl(sm.LargestLoss) : "—", redBrush, redBrush);
             DrawMetricRow("Win Streak", lm.HasData ? lm.WinStreak.ToString() : "—", sm.HasData ? sm.WinStreak.ToString() : "—", greenBrush, greenBrush);
             DrawMetricRow("Loss Streak", lm.HasData ? lm.LossStreak.ToString() : "—", sm.HasData ? sm.LossStreak.ToString() : "—", redBrush, redBrush);
             DrawMetricRow("Avg Hold Win",
