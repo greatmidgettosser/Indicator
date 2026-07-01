@@ -92,6 +92,11 @@ namespace RiskManager
             if (_account == null)
                 _account = Core.Instance.Accounts.FirstOrDefault();
 
+            // If the account is already locked on startup, restore _triggered so the
+            // status displays LOCKED instead of ACTIVE. Nothing else changes.
+            if (_account != null && _account.IsLocked())
+                _triggered = true;
+
             BackfillTodayPnL();
             RefreshUnrealizedPnL();
             SubscribePositionUpdates();
