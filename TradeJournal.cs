@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Timers;
 using TradingPlatform.BusinessLayer;
 using TradingPlatform.BusinessLayer.Native;
@@ -73,11 +75,29 @@ namespace TradeJournal
         public bool HasData;
     }
 
+    // Common shape for a single fill, regardless of whether it came from the live
+    // platform (Core.Instance.GetTrades) or a manually-exported archive CSV. All FIFO
+    // round-trip/fee logic operates on this instead of the platform's Trade type, so
+    // archived days and live days always compute identically.
+    public struct FillRecord
+    {
+        public DateTime DateTime;  // local time
+        public string Symbol;      // root/contract ticker, e.g. "MNQ" or "MNQU26"
+        public double SignedQty;   // positive = buy, negative = sell
+        public double FillValue;   // matches GetFillValue's sign convention (Sell +, Buy -)
+    }
+
     public class TradeJournalPlugin : Plugin
     {
-        private static readonly string JournalFolder = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "Quantower", "TradeJournal");
+        // Notes and the manually-exported trade archive both live outside Quantower's
+        // own AppData tree (which Quantower itself can wipe on update/reset) — under
+        // a user-owned Documents folder instead, so this data is never at the mercy
+        // of another app's housekeeping.
+        private static readonly string RootFolder = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            "Quantower", "Trade Journal");
+        private static readonly string JournalFolder = Path.Combine(RootFolder, "Notes");
+        private static readonly string ArchiveFolder = Path.Combine(RootFolder, "TradeArchive");
 
         private string _selectedDate = DateTime.Today.ToString("yyyy-MM-dd");
         private int _currentMonth = DateTime.Today.Month - 1;
@@ -85,6 +105,7 @@ namespace TradeJournal
         private System.Timers.Timer _saveDebounce;
         private TradeJournalCalendarRenderer _calRenderer;
         private bool _browserReady = false;
+        private readonly HashSet<string> _loadedDates = new HashSet<string>(); // dates whose real content has been pushed into the browser this session
 
         // --- Settings ---
         private Account _account;       // null = all accounts
@@ -96,6 +117,16 @@ namespace TradeJournal
         private bool _calculateFees = false;
         private double _feePerMicro = 0.0;
         private double _feePerMini = 0.0;
+
+        // --- Trade archive (manually-exported CSVs) ---
+        // For any day covered by the archive, it's trusted completely and the platform
+        // is never queried for that day. Days not present in the archive fall back to
+        // the platform, exactly as before. Reloaded automatically whenever a file in
+        // the archive folder changes (new export dropped in, etc).
+        private List<FillRecord> _archiveFillsCache = new List<FillRecord>();
+        private HashSet<string> _archiveCoveredDays = new HashSet<string>();
+        private bool _archiveLoadedOnce = false;
+        private DateTime _archiveScanStamp = DateTime.MinValue;
 
         // Cache so we don't re-query on every redraw. Keyed by (year, month) so the
         // dimmed leading/trailing days from adjacent months can show real stats too,
@@ -133,6 +164,7 @@ namespace TradeJournal
         {
             base.Initialize();
             Directory.CreateDirectory(JournalFolder);
+            Directory.CreateDirectory(ArchiveFolder);
 
             _saveDebounce = new System.Timers.Timer(1000);
             _saveDebounce.AutoReset = false;
@@ -197,17 +229,57 @@ namespace TradeJournal
         private void OnBrowserLoaded(NativeWebBrowserEventArgs args)
         {
             this.Window.Browser.BrowserLoaded -= OnBrowserLoaded;
+            AttemptInitialLoad(_selectedDate, attemptsLeft: 25);
+        }
 
-            var startupTimer = new System.Timers.Timer(3500);
-            startupTimer.AutoReset = false;
-            startupTimer.Elapsed += (s, e) =>
+        // BrowserLoaded firing doesn't guarantee the page's DOM elements are actually
+        // queryable yet, so a single LoadNote call right after it can silently land on
+        // nothing. Instead of guessing a fixed delay, call LoadNote and then read the
+        // value straight back — if it matches what's on disk, the DOM was ready and we
+        // can stop; if not, retry briefly. This uses the exact same GetHtmlValue call
+        // the save path already relies on successfully, so it's verifying with
+        // machinery we know works rather than guessing a duration.
+        private void AttemptInitialLoad(string date, int attemptsLeft)
+        {
+            LoadNote(date);
+
+            try
             {
-                startupTimer.Dispose();
-                LoadNote(_selectedDate);
+                string path = Path.Combine(JournalFolder, $"{date}.txt");
+                string expected = File.Exists(path) ? File.ReadAllText(path) : string.Empty;
+
+                var response = this.Window.Browser.GetHtmlValue("noteArea", HtmlGetValueAction.GetProperty, "value");
+
+                if (response?.Result is string actual && actual == expected)
+                {
+                    _browserReady = true;
+                    _calRenderer.Redraw();
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Core.Instance.Loggers.Log($"[TradeJournal] Initial load readiness check error: {ex.Message}");
+            }
+
+            if (attemptsLeft <= 1)
+            {
+                // Couldn't confirm after ~5s of retries — proceed anyway rather than
+                // leaving the panel stuck forever. Saves are still safe either way,
+                // since they're gated separately by _loadedDates in SaveNoteFromBrowser.
+                Core.Instance.Loggers.Log("[TradeJournal] Browser readiness could not be confirmed; proceeding anyway.");
                 _browserReady = true;
                 _calRenderer.Redraw();
+                return;
+            }
+
+            var retryTimer = new System.Timers.Timer(200) { AutoReset = false };
+            retryTimer.Elapsed += (s, e) =>
+            {
+                retryTimer.Dispose();
+                AttemptInitialLoad(date, attemptsLeft - 1);
             };
-            startupTimer.Start();
+            retryTimer.Start();
         }
 
         public override void Dispose()
@@ -403,6 +475,15 @@ namespace TradeJournal
         {
             if (!_browserReady) return;
             if (string.IsNullOrEmpty(date)) return;
+
+            // Never write to a date whose real content we haven't actually loaded into
+            // the browser yet this session — this is what prevents a stray/premature
+            // input event (e.g. during initial browser attach) from ever overwriting a
+            // real note with an empty one. A date is only trustworthy to save once
+            // LoadNote has run for it at least once, regardless of whether that file
+            // existed or was genuinely blank.
+            if (!_loadedDates.Contains(date)) return;
+
             try
             {
                 var response = this.Window.Browser.GetHtmlValue(
@@ -425,14 +506,7 @@ namespace TradeJournal
         private void WriteNoteToDisk(string date, string content)
         {
             string path = Path.Combine(JournalFolder, $"{date}.txt");
-            if (string.IsNullOrWhiteSpace(content))
-            {
-                if (File.Exists(path)) File.Delete(path);
-            }
-            else
-            {
-                File.WriteAllText(path, content);
-            }
+            File.WriteAllText(path, content ?? string.Empty);
         }
 
         private void LoadNote(string date)
@@ -460,6 +534,10 @@ namespace TradeJournal
                     $"document.getElementById('noteArea').value = '{escaped}';");
                 this.Window.Browser.UpdateHtml("saveIndicator", HtmlAction.SetTextContent, "");
                 this.Window.Browser.UpdateHtml("saveIndicator", HtmlAction.SetClass, "save-indicator");
+
+                // Only now is it safe to let saves through for this date — its real
+                // content (blank or not) has actually been pushed into the browser.
+                _loadedDates.Add(date);
             }
             catch (Exception ex)
             {
@@ -489,7 +567,42 @@ namespace TradeJournal
             if (_monthStatsCache.TryGetValue(cacheKey, out var cached))
                 return cached;
 
-            var stats = new Dictionary<string, DayStats>();
+            Dictionary<string, DayStats> stats;
+            try
+            {
+                var fills = GetFillsForMonth(year, month);
+                stats = AggregateDayStats(fills);
+            }
+            catch (Exception ex)
+            {
+                Core.Instance.Loggers.Log($"[TradeJournal] GetTradeStatsForMonth error: {ex.Message}");
+                stats = new Dictionary<string, DayStats>();
+            }
+
+            _monthStatsCache[cacheKey] = stats;
+            return stats;
+        }
+
+        // Returns every fill for the given month, preferring the archive for any day
+        // it covers and falling back to the live platform for everything else.
+        private List<FillRecord> GetFillsForMonth(int year, int month)
+        {
+            EnsureArchiveLoaded();
+            var combined = new List<FillRecord>();
+
+            var archiveDaysThisMonth = new HashSet<string>(_archiveCoveredDays.Where(d =>
+            {
+                var parts = d.Split('-');
+                return int.Parse(parts[0], CultureInfo.InvariantCulture) == year
+                    && int.Parse(parts[1], CultureInfo.InvariantCulture) == month;
+            }));
+
+            if (archiveDaysThisMonth.Count > 0)
+            {
+                combined.AddRange(_archiveFillsCache.Where(f =>
+                    f.DateTime.Year == year && f.DateTime.Month == month &&
+                    archiveDaysThisMonth.Contains(f.DateTime.ToString("yyyy-MM-dd"))));
+            }
 
             try
             {
@@ -502,85 +615,156 @@ namespace TradeJournal
                     To = monthEnd,
                 });
 
-                if (trades == null)
+                if (trades != null)
                 {
-                    _monthStatsCache[cacheKey] = stats;
-                    return stats;
-                }
-
-                // Group fills by day then by symbol, process FIFO to build round trips.
-                // Key: "yyyy-MM-dd|SYMBOL"  Value: running net qty and accumulated value
-                var daySymbolQty = new Dictionary<string, double>();      // running net position qty
-                var daySymbolValue = new Dictionary<string, double>();   // running accumulated trade value
-                var daySymbolEntryQty = new Dictionary<string, double>(); // running round-trip contract count (entry side)
-
-                foreach (var trade in trades.OrderBy(t => t.DateTime))
-                {
-                    if (_account != null && !trade.Account.Equals(_account)) continue;
-
-                    DateTime tradeDate = trade.DateTime.ToLocalTime().Date;
-                    if (tradeDate.Month != month || tradeDate.Year != year) continue;
-
-                    string dayKey = tradeDate.ToString("yyyy-MM-dd");
-                    string symbol = trade.Symbol?.Id ?? "UNKNOWN";
-                    string posKey = $"{dayKey}|{symbol}";
-
-                    if (!daySymbolQty.ContainsKey(posKey))
+                    foreach (var trade in trades)
                     {
-                        daySymbolQty[posKey] = 0;
-                        daySymbolValue[posKey] = 0;
-                        daySymbolEntryQty[posKey] = 0;
-                    }
+                        if (_account != null && !trade.Account.Equals(_account)) continue;
 
-                    double fillValue = GetFillValue(trade);
-                    if (double.IsNaN(fillValue)) continue;
+                        DateTime localDate = trade.DateTime.ToLocalTime().Date;
+                        if (localDate.Month != month || localDate.Year != year) continue;
 
-                    string side = trade.Side.ToString();
-                    bool isBuy = side.Equals("Buy", StringComparison.OrdinalIgnoreCase);
-                    double qty = isBuy ? trade.Quantity : -trade.Quantity; // signed qty
+                        // Archive already has real data for this day — don't mix in
+                        // platform data too, or the day would be double-counted.
+                        if (archiveDaysThisMonth.Contains(localDate.ToString("yyyy-MM-dd"))) continue;
 
-                    double prevQty = daySymbolQty[posKey];
-                    double newQty = prevQty + qty;
-
-                    // Track contracts on the "entry" side of the round trip (fills that open
-                    // or add to the position), so the fee reflects the true round-trip size
-                    // rather than just the size of the fill that happens to close it.
-                    bool isEntryFill = prevQty == 0 || Math.Sign(prevQty) == Math.Sign(qty);
-                    if (isEntryFill)
-                        daySymbolEntryQty[posKey] += trade.Quantity;
-
-                    daySymbolValue[posKey] += fillValue;
-
-                    // A round trip completes when net qty crosses or returns to zero
-                    if ((prevQty > 0 && newQty <= 0) || (prevQty < 0 && newQty >= 0))
-                    {
-                        double fee = GetFeePerContract(trade.Symbol?.Name) * daySymbolEntryQty[posKey];
-                        double pnl = daySymbolValue[posKey] - fee;
-                        if (!stats.TryGetValue(dayKey, out DayStats dayStats))
-                            dayStats = new DayStats();
-
-                        dayStats.PnL += pnl;
-                        dayStats.RoundTrips++;
-                        dayStats.HasData = true;
-                        stats[dayKey] = dayStats;
-
-                        // Reset accumulators; if qty overshot zero, the remainder starts a new position
-                        daySymbolQty[posKey] = newQty;
-                        daySymbolValue[posKey] = newQty != 0 ? GetFillValue(trade) * (Math.Abs(newQty) / trade.Quantity) : 0;
-                        daySymbolEntryQty[posKey] = newQty != 0 ? Math.Abs(newQty) : 0;
-                    }
-                    else
-                    {
-                        daySymbolQty[posKey] = newQty;
+                        var rec = ToFillRecord(trade);
+                        if (rec.HasValue) combined.Add(rec.Value);
                     }
                 }
             }
             catch (Exception ex)
             {
-                Core.Instance.Loggers.Log($"[TradeJournal] GetTradeStatsForMonth error: {ex.Message}");
+                Core.Instance.Loggers.Log($"[TradeJournal] GetFillsForMonth platform query error: {ex.Message}");
             }
 
-            _monthStatsCache[cacheKey] = stats;
+            return combined;
+        }
+
+        // Returns every fill for a single day, preferring the archive if it covers
+        // that day and falling back to the live platform otherwise.
+        private List<FillRecord> GetFillsForDay(DateTime day)
+        {
+            EnsureArchiveLoaded();
+            string dayKey = day.ToString("yyyy-MM-dd");
+
+            if (_archiveCoveredDays.Contains(dayKey))
+                return _archiveFillsCache.Where(f => f.DateTime.Date == day.Date).ToList();
+
+            var result = new List<FillRecord>();
+            try
+            {
+                var dayStart = new DateTime(day.Year, day.Month, day.Day, 0, 0, 0, DateTimeKind.Utc);
+                var dayEnd = dayStart.AddDays(1);
+
+                var trades = Core.Instance.GetTrades(new TradesHistoryRequestParameters
+                {
+                    From = dayStart,
+                    To = dayEnd,
+                });
+
+                if (trades != null)
+                {
+                    foreach (var trade in trades)
+                    {
+                        if (_account != null && !trade.Account.Equals(_account)) continue;
+                        if (trade.DateTime.ToLocalTime().Date != day.Date) continue;
+
+                        var rec = ToFillRecord(trade);
+                        if (rec.HasValue) result.Add(rec.Value);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Core.Instance.Loggers.Log($"[TradeJournal] GetFillsForDay platform query error: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        // Converts a live platform Trade into the common FillRecord shape.
+        private static FillRecord? ToFillRecord(Trade trade)
+        {
+            double fillValue = GetFillValue(trade);
+            if (double.IsNaN(fillValue)) return null;
+
+            string side = trade.Side.ToString();
+            bool isBuy = side.Equals("Buy", StringComparison.OrdinalIgnoreCase);
+            double signedQty = isBuy ? trade.Quantity : -trade.Quantity;
+            string symbol = trade.Symbol?.Name ?? trade.Symbol?.Id ?? "UNKNOWN";
+
+            return new FillRecord
+            {
+                DateTime = trade.DateTime.ToLocalTime(),
+                Symbol = symbol,
+                SignedQty = signedQty,
+                FillValue = fillValue
+            };
+        }
+
+        // Shared FIFO round-trip aggregation used for the monthly calendar badges.
+        // Operates on FillRecord so live-platform fills and archive-CSV fills are
+        // processed through identical math.
+        private Dictionary<string, DayStats> AggregateDayStats(List<FillRecord> fills)
+        {
+            var stats = new Dictionary<string, DayStats>();
+
+            // Group fills by day then by symbol, process FIFO to build round trips.
+            // Key: "yyyy-MM-dd|SYMBOL"  Value: running net qty and accumulated value
+            var daySymbolQty = new Dictionary<string, double>();      // running net position qty
+            var daySymbolValue = new Dictionary<string, double>();   // running accumulated trade value
+            var daySymbolEntryQty = new Dictionary<string, double>(); // running round-trip contract count (entry side)
+
+            foreach (var fill in fills.OrderBy(f => f.DateTime))
+            {
+                string dayKey = fill.DateTime.Date.ToString("yyyy-MM-dd");
+                string posKey = $"{dayKey}|{fill.Symbol}";
+
+                if (!daySymbolQty.ContainsKey(posKey))
+                {
+                    daySymbolQty[posKey] = 0;
+                    daySymbolValue[posKey] = 0;
+                    daySymbolEntryQty[posKey] = 0;
+                }
+
+                double qty = fill.SignedQty;
+                double prevQty = daySymbolQty[posKey];
+                double newQty = prevQty + qty;
+
+                // Track contracts on the "entry" side of the round trip (fills that open
+                // or add to the position), so the fee reflects the true round-trip size
+                // rather than just the size of the fill that happens to close it.
+                bool isEntryFill = prevQty == 0 || Math.Sign(prevQty) == Math.Sign(qty);
+                if (isEntryFill)
+                    daySymbolEntryQty[posKey] += Math.Abs(qty);
+
+                daySymbolValue[posKey] += fill.FillValue;
+
+                // A round trip completes when net qty crosses or returns to zero
+                if ((prevQty > 0 && newQty <= 0) || (prevQty < 0 && newQty >= 0))
+                {
+                    double fee = GetFeePerContract(fill.Symbol) * daySymbolEntryQty[posKey];
+                    double pnl = daySymbolValue[posKey] - fee;
+                    if (!stats.TryGetValue(dayKey, out DayStats dayStats))
+                        dayStats = new DayStats();
+
+                    dayStats.PnL += pnl;
+                    dayStats.RoundTrips++;
+                    dayStats.HasData = true;
+                    stats[dayKey] = dayStats;
+
+                    // Reset accumulators; if qty overshot zero, the remainder starts a new position
+                    daySymbolQty[posKey] = newQty;
+                    daySymbolValue[posKey] = newQty != 0 ? fill.FillValue * (Math.Abs(newQty) / Math.Abs(qty)) : 0;
+                    daySymbolEntryQty[posKey] = newQty != 0 ? Math.Abs(newQty) : 0;
+                }
+                else
+                {
+                    daySymbolQty[posKey] = newQty;
+                }
+            }
+
             return stats;
         }
 
@@ -602,173 +786,11 @@ namespace TradeJournal
 
             try
             {
-                if (!DateTime.TryParse(date, out DateTime dayDate))
+                if (DateTime.TryParse(date, out DateTime dayDate))
                 {
-                    _dayMetricsCache[date] = metrics;
-                    return metrics;
+                    var dayFills = GetFillsForDay(dayDate);
+                    metrics = AggregateDayMetrics(dayFills);
                 }
-
-                var dayStart = new DateTime(dayDate.Year, dayDate.Month, dayDate.Day, 0, 0, 0, DateTimeKind.Utc);
-                var dayEnd = dayStart.AddDays(1);
-
-                var trades = Core.Instance.GetTrades(new TradesHistoryRequestParameters
-                {
-                    From = dayStart,
-                    To = dayEnd,
-                });
-
-                if (trades == null)
-                {
-                    _dayMetricsCache[date] = metrics;
-                    return metrics;
-                }
-
-                // Sort chronologically so FIFO pairing is correct
-                var dayFills = trades
-                    .Where(t => _account == null || t.Account.Equals(_account))
-                    .Where(t => t.DateTime.ToLocalTime().Date == dayDate.Date)
-                    .OrderBy(t => t.DateTime)
-                    .ToList();
-
-                // FIFO state per symbol: running net qty, accumulated value, and open-fill timestamp
-                var netQty = new Dictionary<string, double>();
-                var netValue = new Dictionary<string, double>();
-                var entryQty = new Dictionary<string, double>(); // running round-trip contract count (entry side)
-                var openTime = new Dictionary<string, DateTime>(); // timestamp of the first fill that opened the position
-
-                var longM = metrics.Long;
-                var shortM = metrics.Short;
-                var pie = metrics.Pie;
-                int longStreakWin = 0, longStreakLoss = 0;
-                int shortStreakWin = 0, shortStreakLoss = 0;
-
-                foreach (var trade in dayFills)
-                {
-                    string symbol = trade.Symbol?.Id ?? "UNKNOWN";
-                    string side = trade.Side.ToString();
-                    bool isBuy = side.Equals("Buy", StringComparison.OrdinalIgnoreCase);
-
-                    if (!netQty.ContainsKey(symbol))
-                    {
-                        netQty[symbol] = 0;
-                        netValue[symbol] = 0;
-                        entryQty[symbol] = 0;
-                    }
-
-                    double signedQty = isBuy ? trade.Quantity : -trade.Quantity;
-                    double prevQty = netQty[symbol];
-                    double newQty = prevQty + signedQty;
-                    double fillValue = GetFillValue(trade);
-                    if (double.IsNaN(fillValue)) { netQty[symbol] = newQty; continue; }
-
-                    // If this fill opens a new position from flat, record the open timestamp
-                    if (prevQty == 0)
-                        openTime[symbol] = trade.DateTime;
-
-                    // Track contracts on the "entry" side of the round trip (fills that open
-                    // or add to the position), so the fee reflects the true round-trip size
-                    // rather than just the size of the fill that happens to close it.
-                    bool isEntryFill = prevQty == 0 || Math.Sign(prevQty) == Math.Sign(signedQty);
-                    if (isEntryFill)
-                        entryQty[symbol] += trade.Quantity;
-
-                    netValue[symbol] += fillValue;
-
-                    // Check if a round trip closed (net qty crossed zero)
-                    bool closedRoundTrip = (prevQty > 0 && newQty <= 0) || (prevQty < 0 && newQty >= 0);
-
-                    if (closedRoundTrip)
-                    {
-                        double fee = GetFeePerContract(trade.Symbol?.Name) * entryQty[symbol];
-                        double pnl = netValue[symbol] - fee;
-                        bool wasLong = prevQty > 0; // long position = opened with Buy fills
-
-                        // Duration: time from open fill to this close fill
-                        double? durationSecs = null;
-                        if (openTime.TryGetValue(symbol, out DateTime ot))
-                        {
-                            var span = trade.DateTime - ot;
-                            if (span.TotalSeconds >= 0)
-                                durationSecs = span.TotalSeconds;
-                        }
-
-                        // Tally into the correct side bucket
-                        ref SideMetrics bucket = ref (wasLong ? ref longM : ref shortM);
-                        ref int streakWin = ref (wasLong ? ref longStreakWin : ref shortStreakWin);
-                        ref int streakLoss = ref (wasLong ? ref longStreakLoss : ref shortStreakLoss);
-
-                        bucket.RoundTrips++;
-                        bucket.TotalPnl += pnl;
-                        bucket.HasData = true;
-                        if (pnl > bucket.LargestWin) bucket.LargestWin = pnl;
-                        if (pnl < bucket.LargestLoss) bucket.LargestLoss = pnl;
-
-                        if (pnl > 0)
-                        {
-                            bucket.Wins++;
-                            bucket.TotalWinPnl += pnl;
-                            bucket.WinCount++;
-                            streakWin++;
-                            streakLoss = 0;
-                            if (streakWin > bucket.WinStreak) bucket.WinStreak = streakWin;
-                            if (durationSecs.HasValue)
-                            {
-                                bucket.TotalWinDurationSeconds += durationSecs.Value;
-                                bucket.WinDurationCount++;
-                            }
-                        }
-                        else if (pnl < 0)
-                        {
-                            bucket.TotalLossPnl += pnl;
-                            bucket.LossCount++;
-                            streakLoss++;
-                            streakWin = 0;
-                            if (streakLoss > bucket.LossStreak) bucket.LossStreak = streakLoss;
-                            if (durationSecs.HasValue)
-                            {
-                                bucket.TotalLossDurationSeconds += durationSecs.Value;
-                                bucket.LossDurationCount++;
-                            }
-                        }
-                        else
-                        {
-                            streakWin = 0;
-                            streakLoss = 0;
-                        }
-
-                        if (durationSecs.HasValue)
-                        {
-                            bucket.TotalDurationSeconds += durationSecs.Value;
-                            bucket.DurationSampleCount++;
-                        }
-
-                        // Pie bucket: ±$2 breakeven band
-                        if (pnl > 2.0) pie.Wins++;
-                        else if (pnl < -2.0) pie.Losses++;
-                        else pie.Breakevens++;
-
-                        // Reset FIFO state; if qty overshot zero, remainder starts a new position
-                        netQty[symbol] = newQty;
-                        netValue[symbol] = newQty != 0 ? fillValue * (Math.Abs(newQty) / trade.Quantity) : 0;
-                        entryQty[symbol] = newQty != 0 ? Math.Abs(newQty) : 0;
-                        if (newQty != 0)
-                            openTime[symbol] = trade.DateTime; // new position opened by this same fill
-                        else
-                            openTime.Remove(symbol);
-
-                        // Write back ref-struct mutations (C# ref locals on structs)
-                        if (wasLong) longM = bucket; else shortM = bucket;
-                    }
-                    else
-                    {
-                        netQty[symbol] = newQty;
-                    }
-                }
-
-                metrics.Long = longM;
-                metrics.Short = shortM;
-                metrics.Pie = pie;
-                metrics.HasData = longM.HasData || shortM.HasData;
             }
             catch (Exception ex)
             {
@@ -776,6 +798,157 @@ namespace TradeJournal
             }
 
             _dayMetricsCache[date] = metrics;
+            return metrics;
+        }
+
+        // Shared FIFO round-trip aggregation used for the per-day detail panel
+        // (long/short breakdowns, win rate, streaks, hold times, pie chart). Operates
+        // on FillRecord so live-platform fills and archive-CSV fills are processed
+        // through identical math.
+        private DayMetrics AggregateDayMetrics(List<FillRecord> dayFills)
+        {
+            var metrics = new DayMetrics
+            {
+                Long = new SideMetrics { LargestLoss = 0 },
+                Short = new SideMetrics { LargestLoss = 0 },
+                Pie = new PieBuckets()
+            };
+
+            // FIFO state per symbol: running net qty, accumulated value, and open-fill timestamp
+            var netQty = new Dictionary<string, double>();
+            var netValue = new Dictionary<string, double>();
+            var entryQty = new Dictionary<string, double>(); // running round-trip contract count (entry side)
+            var openTime = new Dictionary<string, DateTime>(); // timestamp of the first fill that opened the position
+
+            var longM = metrics.Long;
+            var shortM = metrics.Short;
+            var pie = metrics.Pie;
+            int longStreakWin = 0, longStreakLoss = 0;
+            int shortStreakWin = 0, shortStreakLoss = 0;
+
+            foreach (var fill in dayFills.OrderBy(f => f.DateTime))
+            {
+                string symbol = fill.Symbol;
+
+                if (!netQty.ContainsKey(symbol))
+                {
+                    netQty[symbol] = 0;
+                    netValue[symbol] = 0;
+                    entryQty[symbol] = 0;
+                }
+
+                double signedQty = fill.SignedQty;
+                double prevQty = netQty[symbol];
+                double newQty = prevQty + signedQty;
+
+                // If this fill opens a new position from flat, record the open timestamp
+                if (prevQty == 0)
+                    openTime[symbol] = fill.DateTime;
+
+                // Track contracts on the "entry" side of the round trip (fills that open
+                // or add to the position), so the fee reflects the true round-trip size
+                // rather than just the size of the fill that happens to close it.
+                bool isEntryFill = prevQty == 0 || Math.Sign(prevQty) == Math.Sign(signedQty);
+                if (isEntryFill)
+                    entryQty[symbol] += Math.Abs(signedQty);
+
+                netValue[symbol] += fill.FillValue;
+
+                // Check if a round trip closed (net qty crossed zero)
+                bool closedRoundTrip = (prevQty > 0 && newQty <= 0) || (prevQty < 0 && newQty >= 0);
+
+                if (closedRoundTrip)
+                {
+                    double fee = GetFeePerContract(symbol) * entryQty[symbol];
+                    double pnl = netValue[symbol] - fee;
+                    bool wasLong = prevQty > 0; // long position = opened with Buy fills
+
+                    // Duration: time from open fill to this close fill
+                    double? durationSecs = null;
+                    if (openTime.TryGetValue(symbol, out DateTime ot))
+                    {
+                        var span = fill.DateTime - ot;
+                        if (span.TotalSeconds >= 0)
+                            durationSecs = span.TotalSeconds;
+                    }
+
+                    // Tally into the correct side bucket
+                    ref SideMetrics bucket = ref (wasLong ? ref longM : ref shortM);
+                    ref int streakWin = ref (wasLong ? ref longStreakWin : ref shortStreakWin);
+                    ref int streakLoss = ref (wasLong ? ref longStreakLoss : ref shortStreakLoss);
+
+                    bucket.RoundTrips++;
+                    bucket.TotalPnl += pnl;
+                    bucket.HasData = true;
+                    if (pnl > bucket.LargestWin) bucket.LargestWin = pnl;
+                    if (pnl < bucket.LargestLoss) bucket.LargestLoss = pnl;
+
+                    if (pnl > 0)
+                    {
+                        bucket.Wins++;
+                        bucket.TotalWinPnl += pnl;
+                        bucket.WinCount++;
+                        streakWin++;
+                        streakLoss = 0;
+                        if (streakWin > bucket.WinStreak) bucket.WinStreak = streakWin;
+                        if (durationSecs.HasValue)
+                        {
+                            bucket.TotalWinDurationSeconds += durationSecs.Value;
+                            bucket.WinDurationCount++;
+                        }
+                    }
+                    else if (pnl < 0)
+                    {
+                        bucket.TotalLossPnl += pnl;
+                        bucket.LossCount++;
+                        streakLoss++;
+                        streakWin = 0;
+                        if (streakLoss > bucket.LossStreak) bucket.LossStreak = streakLoss;
+                        if (durationSecs.HasValue)
+                        {
+                            bucket.TotalLossDurationSeconds += durationSecs.Value;
+                            bucket.LossDurationCount++;
+                        }
+                    }
+                    else
+                    {
+                        streakWin = 0;
+                        streakLoss = 0;
+                    }
+
+                    if (durationSecs.HasValue)
+                    {
+                        bucket.TotalDurationSeconds += durationSecs.Value;
+                        bucket.DurationSampleCount++;
+                    }
+
+                    // Pie bucket: ±$2 breakeven band
+                    if (pnl > 2.0) pie.Wins++;
+                    else if (pnl < -2.0) pie.Losses++;
+                    else pie.Breakevens++;
+
+                    // Reset FIFO state; if qty overshot zero, remainder starts a new position
+                    netQty[symbol] = newQty;
+                    netValue[symbol] = newQty != 0 ? fill.FillValue * (Math.Abs(newQty) / Math.Abs(signedQty)) : 0;
+                    entryQty[symbol] = newQty != 0 ? Math.Abs(newQty) : 0;
+                    if (newQty != 0)
+                        openTime[symbol] = fill.DateTime; // new position opened by this same fill
+                    else
+                        openTime.Remove(symbol);
+
+                    // Write back ref-struct mutations (C# ref locals on structs)
+                    if (wasLong) longM = bucket; else shortM = bucket;
+                }
+                else
+                {
+                    netQty[symbol] = newQty;
+                }
+            }
+
+            metrics.Long = longM;
+            metrics.Short = shortM;
+            metrics.Pie = pie;
+            metrics.HasData = longM.HasData || shortM.HasData;
             return metrics;
         }
 
@@ -825,6 +998,162 @@ namespace TradeJournal
             return 0.0;
         }
 
+        // --- Trade archive (manually-exported CSVs) ---
+
+        // (Re)loads the archive from disk if any file in ArchiveFolder is new or has
+        // changed since the last scan. Cheap to call often — the timestamp check is
+        // just a directory listing, so callers don't need to manage this themselves.
+        private void EnsureArchiveLoaded()
+        {
+            DateTime latestWrite = DateTime.MinValue;
+            var files = new List<string>();
+
+            try
+            {
+                if (Directory.Exists(ArchiveFolder))
+                {
+                    files.AddRange(Directory.GetFiles(ArchiveFolder, "*.csv"));
+                    foreach (var f in files)
+                    {
+                        var t = File.GetLastWriteTimeUtc(f);
+                        if (t > latestWrite) latestWrite = t;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Core.Instance.Loggers.Log($"[TradeJournal] Archive folder scan error: {ex.Message}");
+            }
+
+            if (_archiveLoadedOnce && latestWrite == _archiveScanStamp)
+                return; // nothing new since last load
+
+            var fills = new List<FillRecord>();
+            var coveredDays = new HashSet<string>();
+            var seenTradeIds = new HashSet<string>();
+
+            foreach (var file in files)
+            {
+                try
+                {
+                    foreach (var row in ParseArchiveCsv(file))
+                    {
+                        // A day counts as "covered" the moment any row for it appears,
+                        // even if that specific row turns out to be a duplicate below.
+                        coveredDays.Add(row.DayKey);
+
+                        if (!string.IsNullOrEmpty(row.TradeId) && !seenTradeIds.Add(row.TradeId))
+                            continue; // already saw this exact fill in another export file
+
+                        fills.Add(row.Fill);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Core.Instance.Loggers.Log($"[TradeJournal] Error parsing archive file '{Path.GetFileName(file)}': {ex.Message}");
+                }
+            }
+
+            _archiveFillsCache = fills;
+            _archiveCoveredDays = coveredDays;
+            _archiveScanStamp = latestWrite;
+            _archiveLoadedOnce = true;
+
+            InvalidateStatsCache(); // archive contents changed — drop anything derived from the old data
+        }
+
+        // Parses one exported CSV into fill records. Column order is looked up by
+        // header name (not fixed position) so re-ordered/re-exported columns still work.
+        // Required columns: Date/Time, Quantity, Trade value, and either Underlier or
+        // Symbol. Fee/Gross P/L/Net P/L columns are intentionally ignored — they're
+        // unreliable in this export (often 0 even for real closed trades) and fees are
+        // computed from the plugin's own settings instead, exactly like live trades.
+        private IEnumerable<(FillRecord Fill, string TradeId, string DayKey)> ParseArchiveCsv(string path)
+        {
+            var lines = File.ReadAllLines(path); // auto-detects the UTF-8 BOM this export uses
+            if (lines.Length == 0) yield break;
+
+            var header = ParseCsvLine(lines[0]);
+            var col = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < header.Length; i++)
+            {
+                var name = header[i].Trim();
+                if (!string.IsNullOrEmpty(name) && !col.ContainsKey(name))
+                    col[name] = i;
+            }
+
+            if (!col.ContainsKey("Date/Time") || !col.ContainsKey("Quantity") || !col.ContainsKey("Trade value")
+                || (!col.ContainsKey("Underlier") && !col.ContainsKey("Symbol")))
+            {
+                Core.Instance.Loggers.Log($"[TradeJournal] Archive file '{Path.GetFileName(path)}' is missing expected columns — skipped.");
+                yield break;
+            }
+
+            for (int i = 1; i < lines.Length; i++)
+            {
+                if (string.IsNullOrWhiteSpace(lines[i])) continue;
+
+                var fields = ParseCsvLine(lines[i]);
+                if (fields.Length <= col["Trade value"]) continue;
+
+                string symbol = col.TryGetValue("Underlier", out int uIdx) && uIdx < fields.Length && !string.IsNullOrWhiteSpace(fields[uIdx])
+                    ? fields[uIdx].Trim()
+                    : (col.TryGetValue("Symbol", out int sIdx) && sIdx < fields.Length ? fields[sIdx].Trim() : null);
+                if (string.IsNullOrEmpty(symbol)) continue;
+
+                if (!DateTime.TryParse(fields[col["Date/Time"]], CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
+                    continue;
+                if (!double.TryParse(fields[col["Quantity"]], NumberStyles.Float, CultureInfo.InvariantCulture, out double qty))
+                    continue;
+                if (!double.TryParse(fields[col["Trade value"]], NumberStyles.Float, CultureInfo.InvariantCulture, out double tradeValue))
+                    continue;
+
+                string tradeId = col.TryGetValue("Trade ID", out int tIdx) && tIdx < fields.Length ? fields[tIdx].Trim() : null;
+
+                var fill = new FillRecord
+                {
+                    DateTime = dt,
+                    Symbol = symbol,
+                    SignedQty = qty,          // export already signs this: + buy, - sell
+                    FillValue = -tradeValue,  // Trade value's sign convention is inverted vs GetFillValue
+                };
+
+                yield return (fill, tradeId, dt.Date.ToString("yyyy-MM-dd"));
+            }
+        }
+
+        // Minimal CSV line splitter that handles quoted fields (including embedded
+        // commas and escaped "" quotes), since some columns like "Gross P/L,ticks"
+        // contain commas inside quotes.
+        private static string[] ParseCsvLine(string line)
+        {
+            var result = new List<string>();
+            var sb = new StringBuilder();
+            bool inQuotes = false;
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (inQuotes)
+                {
+                    if (c == '"')
+                    {
+                        if (i + 1 < line.Length && line[i + 1] == '"') { sb.Append('"'); i++; }
+                        else inQuotes = false;
+                    }
+                    else sb.Append(c);
+                }
+                else
+                {
+                    if (c == '"') inQuotes = true;
+                    else if (c == ',') { result.Add(sb.ToString()); sb.Clear(); }
+                    else sb.Append(c);
+                }
+            }
+            result.Add(sb.ToString());
+            return result.ToArray();
+        }
+
         // Expose state to renderer
         public int CurrentMonth => _currentMonth;
         public int CurrentYear => _currentYear;
@@ -836,7 +1165,12 @@ namespace TradeJournal
         {
             var dates = new HashSet<string>();
             foreach (var file in Directory.GetFiles(JournalFolder, "*.txt"))
+            {
+                // Skip 0-byte files (a cleared note) so the calendar's note-underline
+                // indicator only shows for days that actually have content.
+                if (new FileInfo(file).Length == 0) continue;
                 dates.Add(Path.GetFileNameWithoutExtension(file));
+            }
             return dates;
         }
     }
