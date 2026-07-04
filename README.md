@@ -1,6 +1,6 @@
-RiskParameters.dll / Risk_Manager_v2.cs is the version without the ability to change the daily reset time! These are hardcoded to reset at 5:30 pm eastern time during the 1 hour that the futures market is closed. The RiskManager.dll and Risk_Manager.cs version allows user to manually set the daily reset timer so if you lock the account, you can set the timer to be 1 minute from now and when that time hits the account will unlock.
+RiskParameters.dll / Risk_Manager_v2.cs is the version without the ability to change the daily reset time! These are hardcoded to reset at 5:00 pm eastern time during the 1 hour that the futures market is closed. The RiskManager.dll and Risk_Manager.cs version allows user to manually set the daily reset timer so if you lock the account, you can set the timer to be 1 minute from now and when that time hits the account will unlock.
 
-# Indicator
+
 Market Structure Table Custom Indicator for Quantower
 
 Per bar expectancy has 2 values: How much price has moved relative to VWAP over time and Average point return per bar
