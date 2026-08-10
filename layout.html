@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="../../../themes/default/css/colors.css" />
+    <link rel="stylesheet" href="../../../themes/default/css/core.css" />
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg: #1e1e1e;
+            --text: #ffffff;
+            --border: #333;
+            --dim: #aaa;
+            --placeholder: #555;
+            --field-bg: #1a1a1a;
+            --field-border: #333;
+            --field-focus-border: #555;
+            --accent: #00c864;
+            --gold: #ccaa00;
+            --thumb-bg: #2a2a2a;
+            --thumb-border: #444;
+            --thumb-hover-bg: #1a2a1a;
+        }
+
+        body.light-mode {
+            --bg: #ebf2fa;
+            --text: #14202f;
+            --border: #c8d6e8;
+            --dim: #5f7080;
+            --placeholder: #93a5b8;
+            --field-bg: #f7fafd;
+            --field-border: #c8d6e8;
+            --field-focus-border: #7d95ab;
+            --accent: #0fa155;
+            --gold: #8a6d0a;
+            --thumb-bg: #dce8f5;
+            --thumb-border: #a0b8cc;
+            --thumb-hover-bg: #d6f0e0;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .note-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 12px;
+            overflow: hidden;
+        }
+
+        .note-section {
+            flex: 1 1 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-height: 0;
+        }
+
+        .trade-note-section {
+            flex: 0 0 auto;
+            display: flex;
+            flex-direction: column;
+            margin-bottom: 2px;
+            padding-bottom: 2px;
+            border-bottom: 1px solid var(--border);
+            min-height: 83px;
+            max-height: 122px;
+        }
+
+        .trade-note-header {
+            font-size: 12px;
+            font-weight: bold;
+            color: var(--dim);
+            margin-bottom: 6px;
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            overflow: hidden;
+        }
+
+        #screenshotStrip {
+            display: none;
+            flex-direction: row;
+            align-items: center;
+            gap: 4px;
+            margin-left: 8px;
+            flex-shrink: 0;
+        }
+
+            #screenshotStrip.visible {
+                display: inline-flex;
+            }
+
+        /* tradeNoteLabel is the flex row — it holds all pieces inline */
+        #tradeNoteLabel {
+            display: flex;
+            align-items: center;
+            flex-wrap: nowrap;
+            gap: 5px;
+            overflow: hidden;
+        }
+
+        .trade-note-prefix {
+            color: var(--dim);
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .trade-note-title {
+            color: var(--accent);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            flex-shrink: 1;
+            min-width: 0;
+            margin-right: 4px;
+        }
+
+        .ss-group-label {
+            color: var(--dim);
+            font-size: 11px;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .ss-group-sep {
+            flex-shrink: 0;
+            width: 8px;
+        }
+
+        .ss-thumb-btn {
+            background: var(--thumb-bg);
+            border: 1px solid var(--thumb-border);
+            border-radius: 2px;
+            padding: 0;
+            cursor: pointer;
+            width: 14px;
+            height: 14px;
+            flex-shrink: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            line-height: 1;
+            text-decoration: none;
+            color: inherit;
+        }
+
+            .ss-thumb-btn:hover {
+                border-color: var(--accent);
+                background: var(--thumb-hover-bg);
+            }
+
+            .ss-thumb-btn img {
+                display: block;
+                width: 12px;
+                height: 12px;
+                object-fit: cover;
+                border-radius: 1px;
+            }
+
+        #tradeNoteArea {
+            flex: 1;
+            background: var(--field-bg);
+            border: 1px solid var(--field-border);
+            border-radius: 4px;
+            color: var(--text);
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            padding: 8px;
+            outline: none;
+            line-height: 1.5;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            cursor: text;
+        }
+
+            #tradeNoteArea:empty::before {
+                content: attr(data-placeholder);
+                color: var(--placeholder);
+                pointer-events: none;
+            }
+
+            #tradeNoteArea:focus {
+                border-color: var(--field-focus-border);
+            }
+
+        .trade-note-save-indicator {
+            font-size: 10px;
+            color: var(--placeholder);
+            text-align: right;
+            margin-top: 1px;
+            height: 4px;
+        }
+
+            .trade-note-save-indicator.saved {
+                color: var(--accent);
+            }
+
+        .note-header {
+            font-size: 14px;
+            font-weight: bold;
+            color: var(--dim);
+            margin-bottom: 8px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        #selectedDateLabel {
+            color: var(--accent);
+        }
+
+        #noteArea {
+            flex: 1;
+            background: var(--field-bg);
+            border: 1px solid var(--field-border);
+            border-radius: 4px;
+            color: var(--text);
+            font-family: Arial, sans-serif;
+            font-size: 13px;
+            padding: 10px;
+            outline: none;
+            line-height: 1.6;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            cursor: text;
+        }
+
+            #noteArea:empty::before {
+                content: attr(data-placeholder);
+                color: var(--placeholder);
+                pointer-events: none;
+            }
+
+            #noteArea:focus {
+                border-color: var(--field-focus-border);
+            }
+
+        .save-indicator {
+            font-size: 10px;
+            color: var(--placeholder);
+            text-align: right;
+            margin-top: 4px;
+            height: 14px;
+        }
+
+            .save-indicator.saved {
+                color: var(--accent);
+            }
+
+        .daily-verse {
+            font-size: 12px;
+            color: var(--dim);
+            font-style: italic;
+            margin-left: 10px;
+            line-height: 1.4;
+        }
+
+        .daily-verse-ref {
+            font-size: 11px;
+            color: var(--gold);
+            font-style: normal;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body id="pageBody">
+    <div class="note-panel">
+        <div class="trade-note-section">
+            <div class="trade-note-header">
+                <span id="tradeNoteLabel"><span class="trade-note-prefix">Trade Note</span></span>
+                <span id="screenshotStrip"></span>
+            </div>
+            <div id="tradeNoteArea" contenteditable="true" data-placeholder="Click a trade to attach a note..."></div>
+            <div class="trade-note-save-indicator" id="tradeNoteSaveIndicator"></div>
+        </div>
+        <div class="note-section">
+            <div class="note-header">
+                <span id="selectedDateLabel">Select a day to begin</span><span class="daily-verse" id="dailyVerseText"></span>
+            </div>
+            <div id="noteArea" contenteditable="true" data-placeholder="Write your daily notes here..."></div>
+            <div class="save-indicator" id="saveIndicator"></div>
+        </div>
+    </div>
+</body>
+</html>
