@@ -1,10 +1,15 @@
 import asyncio
 import pandas as pd
 from alpaca.data.live import StockDataStream
-from datetime import datetime
+# NEW: REST history client used by the backfill functions
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
+from datetime import datetime, timedelta   # CHANGED: timedelta added
 import pytz
 import os
-import schedule
+# CHANGED: "import schedule" removed - scheduling is now done by et_schedule_tick() below
 import time
 import threading
 import dropbox
@@ -20,13 +25,16 @@ DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 APP_KEY_DBX           = os.getenv("APP_KEY_DBX")
 APP_SECRET_DBX        = os.getenv("APP_SECRET_DBX")
 
-SYMBOLS  = ["SPY","QQQ","IWM","AAPL","AMZN","PLTR","TSLA","IBIT","SLV","NVDA",
-            "MSFT","META","MARA","GOOGL","AMD","ARM","GLD","SMCI","MU","SNDK",
-            "DELL","INTC", "RKLB", "CRCL", "NFLX", "IREN", "MSTR", "CVNA", "NOK", "SPCX"]
+SYMBOLS  = ["SPY","QQQ","IWM","AAPL","AMZN","TSLA","SLV","NVDA",
+            "MSFT","MARA","META","GOOGL","GLD","IBIT","INTC","AMD","NFLX","SOFI"]
 CSV_DIR  = "/home/ubuntu/alpaca-stream/live_data"
 eastern  = pytz.timezone("America/New_York")
 wss_client = None
 bar_queue  = asyncio.Queue()
+
+# NEW: serializes writes to the 1-min CSVs between the live stream (process_bar)
+# and the backfill, so neither can overwrite the other's rows.
+file_lock = threading.Lock()
 
 os.makedirs(CSV_DIR, exist_ok=True)
 
@@ -74,6 +82,111 @@ def resample_to_5min(symbol):
         print(f"Resample error for {symbol}: {e}")
     return out_path
 
+# ---------------------------------------------------------------------------
+# NEW: backfill from Alpaca REST history (regular session 9:30-16:00 ET only)
+# ---------------------------------------------------------------------------
+BACKFILL_END_BUFFER_MIN = 2      # only fetch bars older than this, so unfinished minutes are never inserted
+BACKFILL_LOOKBACK_MIN   = 60     # periodic check re-fetches this many minutes
+BACKFILL_INTERVAL_SEC   = 300    # periodic check runs every 5 minutes
+BACKFILL_LAST_HM        = (16, 5)  # ET: last periodic run of the day
+backfill_guard = threading.Lock()  # prevents two backfills running at once
+last_backfill  = {"t": time.time()}
+
+def backfill_window(lookback_min=None):
+    """Returns (start, end) in ET for the bars to check, or None if there is nothing to check.
+    lookback_min=None means the whole session so far (used at startup)."""
+    now_et = datetime.now(eastern)
+    if now_et.weekday() >= 5:
+        return None
+    open_et  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_et = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    end = min(now_et - timedelta(minutes=BACKFILL_END_BUFFER_MIN), close_et)
+    if lookback_min is None:
+        start = open_et
+    else:
+        start = max(open_et, end - timedelta(minutes=lookback_min))
+    if end <= start:
+        return None
+    return start, end
+
+def backfill_bars(start, end):
+    """Add 1-min bars that Alpaca has for [start, end) but the local CSVs lack.
+    Existing rows are never changed. Rebuilds the 5-min file and re-uploads only
+    the symbols that changed. Returns the number of bars added."""
+    try:
+        client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+        req = StockBarsRequest(
+            symbol_or_symbols=SYMBOLS,
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            feed=DataFeed.IEX,
+        )
+        hist = client.get_stock_bars(req).df
+    except Exception as e:
+        print(f"Backfill fetch failed: {e}", flush=True)
+        return 0
+
+    if hist.empty:
+        return 0
+
+    total = 0
+    hist = hist.reset_index()
+    for sym, h in hist.groupby("symbol"):
+        try:
+            h = h[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+            h["timestamp"] = pd.to_datetime(h["timestamp"], utc=True)
+            path = f"{CSV_DIR}/{sym}_live.csv"
+
+            with file_lock:
+                if os.path.exists(path):
+                    cur = pd.read_csv(path)
+                    cur["timestamp"] = pd.to_datetime(cur["timestamp"], utc=True)
+                    new = h[~h["timestamp"].isin(cur["timestamp"])]
+                    if new.empty:
+                        continue
+                    merged = pd.concat([cur, new])
+                else:
+                    new = h
+                    merged = h
+
+                merged = merged.sort_values("timestamp")
+                merged["timestamp"] = merged["timestamp"].dt.tz_convert(eastern)
+                tmp_path = path + ".tmp"
+                merged.to_csv(tmp_path, index=False)
+                os.replace(tmp_path, path)   # atomic swap: readers never see a half-written file
+
+            out_5 = resample_to_5min(sym)
+            upload_to_dropbox(sym, path, f"/Live Market Data/{sym}_live.csv")
+            upload_to_dropbox(sym, out_5, f"/Live Market Data/{sym}_live_5min.csv")
+            total += len(new)
+            print(f"Backfilled {len(new)} bars for {sym}", flush=True)
+        except Exception as e:
+            print(f"Backfill error for {sym}: {e}", flush=True)
+    return total
+
+def backfill_today():
+    """Startup backfill: checks the whole regular session so far."""
+    window = backfill_window()
+    if window is None:
+        print("Startup backfill skipped (no regular session to check)", flush=True)
+        return
+    added = backfill_bars(*window)
+    print(f"Startup backfill complete: {added} bars added", flush=True)
+
+def periodic_backfill():
+    """Runs every 5 minutes during the session: re-checks the last hour."""
+    if not backfill_guard.acquire(blocking=False):
+        return
+    try:
+        window = backfill_window(BACKFILL_LOOKBACK_MIN)
+        if window is not None:
+            backfill_bars(*window)
+    except Exception as e:
+        print(f"Periodic backfill error: {e}", flush=True)
+    finally:
+        backfill_guard.release()
+
 last_bar_time = {"t": time.time()}  # updated on every bar
 
 async def bar_handler(bar):
@@ -109,8 +222,10 @@ async def process_bar(bar):
             "volume":    bar.volume
         }
         df = pd.DataFrame([row])
-        write_header = not os.path.exists(local_path)
-        df.to_csv(local_path, mode="a", header=write_header, index=False)
+        # CHANGED: append is done under file_lock so a backfill can't rewrite the file mid-append
+        with file_lock:
+            write_header = not os.path.exists(local_path)
+            df.to_csv(local_path, mode="a", header=write_header, index=False)
         print(f"Bar saved: {bar.symbol} {ts_eastern}")
 
         loop = asyncio.get_event_loop()
@@ -164,15 +279,28 @@ def clear_old_csvs():
                 os.remove(fpath)
     print("Old CSV files cleared, today's data preserved.")
 
+# NEW: only one websocket may be connected per account. start_stream() is called
+# at import AND by the 9:30 job, so this guard stops it from opening a second
+# connection (which Alpaca rejects with "connection limit exceeded").
+stream_active = threading.Event()
+
+# CHANGED: start_stream now refuses to run if a stream is already active
 def start_stream():
     global wss_client
-    print("Starting stream...")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(bar_processor())
-    wss_client = StockDataStream(API_KEY, SECRET_KEY)
-    wss_client.subscribe_bars(bar_handler, *SYMBOLS)
-    loop.run_until_complete(wss_client._run_forever())
+    if stream_active.is_set():
+        print("Stream already running, not starting a second one", flush=True)
+        return
+    stream_active.set()
+    try:
+        print("Starting stream...")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.create_task(bar_processor())
+        wss_client = StockDataStream(API_KEY, SECRET_KEY)
+        wss_client.subscribe_bars(bar_handler, *SYMBOLS)
+        loop.run_until_complete(wss_client._run_forever())
+    finally:
+        stream_active.clear()
 
 def stop_stream():
     global wss_client
@@ -180,16 +308,51 @@ def stop_stream():
         print("Stopping stream...")
         wss_client.close()
 
+# CHANGED: scheduling is now based on America/New_York time instead of the
+# server's UTC clock, so it stays correct across daylight saving changes.
+# Replaces the old schedule.every().<day>.at("13:30") / at("20:01") jobs
+# (those times were UTC: 9:30 ET and 16:01 ET).
+OPEN_HM  = (9, 30)   # ET: clean old CSVs and make sure the stream is running
+CLOSE_HM = (16, 1)   # ET: stop the stream (was 20:01 UTC = 16:01 ET)
+sched_done = {"open": None, "close": None}
+
+def et_schedule_tick():
+    now = datetime.now(eastern)
+    if now.weekday() >= 5:
+        return
+    today = now.date()
+    hm = (now.hour, now.minute)
+    if hm >= OPEN_HM and sched_done["open"] != today:
+        sched_done["open"] = today
+        clear_old_csvs()
+        threading.Thread(target=start_stream, daemon=True).start()
+    if hm >= CLOSE_HM and sched_done["close"] != today:
+        sched_done["close"] = today
+        stop_stream()
+    # NEW: periodic gap check, every 5 minutes from the open until a few minutes after the close
+    if (OPEN_HM <= hm <= BACKFILL_LAST_HM
+            and time.time() - last_backfill["t"] >= BACKFILL_INTERVAL_SEC):
+        last_backfill["t"] = time.time()
+        threading.Thread(target=periodic_backfill, daemon=True).start()
+
+# If the process starts after a daily event time, treat that event as already
+# handled today (same as the old scheduler, which only fired at the clock time).
+_start_et = datetime.now(eastern)
+_start_hm = (_start_et.hour, _start_et.minute)
+if _start_hm >= OPEN_HM:
+    sched_done["open"] = _start_et.date()
+if _start_hm >= CLOSE_HM:
+    sched_done["close"] = _start_et.date()
+
+# NEW: fill any gap in today's regular session before the live stream starts
+backfill_today()
+last_bar_time["t"] = time.time()   # don't let backfill time count as silence for the watchdog
+last_backfill["t"] = time.time()   # first periodic check runs 5 minutes after startup
+
 threading.Thread(target=start_stream, daemon=True).start()
 threading.Thread(target=watchdog, daemon=True).start()
 
-for day in ["monday","tuesday","wednesday","thursday","friday"]:
-    getattr(schedule.every(), day).at("13:30").do(
-        lambda: [clear_old_csvs(), threading.Thread(target=start_stream, daemon=True).start()]
-    )
-    getattr(schedule.every(), day).at("20:01").do(stop_stream)
-
 print("Scheduler running, waiting for market hours...")
 while True:
-    schedule.run_pending()
+    et_schedule_tick()
     time.sleep(1)
