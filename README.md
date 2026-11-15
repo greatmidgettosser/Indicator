@@ -1,1 +1,7 @@
 RiskParameters.dll is the version without the ability to change the daily reset time! This version is hardcoded to reset at 5:00 pm eastern time when the futures market closes. YOU WILL BE LOCKED OUT FOR THE REMAINDER OF THE TRADING SESSION AND WILL NOT BE ABLE TO UNLOCK THE ACCOUNT UNTIL THE RESET TIME TRIGGERS!! The RiskManager.dll version allows user to manually set the daily reset timer so if you lock the account, you can set the timer to be 1 minute from the current time and when that time hits the account will unlock.
+
+Layout.html is a dependency for TradeJournal.cs
+
+bar_utils is a dependency for Trend-Pullback Screener
+
+Alpaca Websocket script is designed to be run on a virtual server
